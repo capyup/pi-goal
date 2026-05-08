@@ -8,6 +8,7 @@ const STATE_ENTRY = "pi-goal-state";
 const COMPLETE_STATUS = "complete";
 const GOALS_DIR = ".pi/goals";
 const ARCHIVED_GOALS_DIR = ".pi/goals/archived";
+const CONTINUATION_IDLE_RETRY_MS = 250;
 
 type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
 type StopReason = "token_budget" | "max_turns" | "user" | "agent";
@@ -774,12 +775,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (continuationQueuedFor === goalId) continuationQueuedFor = null;
 			return;
 		}
-		const prompt = continuationPrompt(goal);
-		if (ctx.isIdle()) {
-			pi.sendUserMessage(prompt);
-		} else {
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		if (!ctx.isIdle()) {
+			continuationTimer = setTimeout(() => sendQueuedContinuation(ctx, goalId), CONTINUATION_IDLE_RETRY_MS);
+			return;
 		}
+		const prompt = continuationPrompt(goal);
+		pi.sendUserMessage(prompt);
 	}
 
 	function queueContinuation(ctx: ExtensionContext, force = false): void {
@@ -792,7 +793,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (ctx.isIdle()) {
 			sendQueuedContinuation(ctx, goalId);
 		} else {
-			continuationTimer = setTimeout(() => sendQueuedContinuation(ctx, goalId), 0);
+			continuationTimer = setTimeout(() => sendQueuedContinuation(ctx, goalId), CONTINUATION_IDLE_RETRY_MS);
 		}
 	}
 
@@ -1041,6 +1042,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		loadState(ctx);
 		queueContinuation(ctx, true);
+	});
+	pi.on("session_compact", async (_event, ctx) => {
+		if (goal?.status === "active" && goal.autoContinue) queueContinuation(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => loadState(ctx));
 

@@ -137,7 +137,7 @@ The extension exposes three tools to the model:
 
 ## How Autonomous Continuation Works
 
-When a goal is active and auto-continue is enabled, pi injects goal context into the system prompt and starts a continuation turn after each agent turn has fully returned to idle. Active auto-continue goals are also restarted when the session starts or resumes. Each injected goal message includes a goal id. If the user replaces or clears the goal while a run is in flight, stale continuations and stale completion attempts are ignored.
+When a goal is active and auto-continue is enabled, pi injects goal context into the system prompt and starts a continuation turn after the agent has fully returned to idle, including after auto-compaction. Active auto-continue goals are also restarted when the session starts or resumes. Each injected goal message includes a goal id. If the user replaces or clears the goal while a run is in flight, stale continuations and stale completion attempts are ignored.
 
 Autonomous continuation stops when:
 
