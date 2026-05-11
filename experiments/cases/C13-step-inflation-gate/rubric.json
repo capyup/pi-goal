@@ -1,0 +1,51 @@
+[
+  {
+    "id": "propose-goal-draft-called",
+    "desc": "Agent should propose via propose_goal_draft.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "final-proposal-is-sisyphus",
+    "desc": "/goal-sis must produce sisyphus=true.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": ".sisyphus == true"
+  },
+  {
+    "id": "objective-has-only-two-numbered-steps",
+    "desc": "Final accepted objective must have exactly 2 numbered steps (no agent-inflated step 3+).",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": "(.objective | test(\"(?m)^\\\\s*1\\\\.\\\\s\")) and (.objective | test(\"(?m)^\\\\s*2\\\\.\\\\s\")) and ((.objective | test(\"(?m)^\\\\s*3\\\\.\\\\s\")) | not)"
+  },
+  {
+    "id": "a-txt-created",
+    "desc": "a.txt exists with 'alpha'.",
+    "kind": "sandbox-file-contains",
+    "path": "a.txt",
+    "pattern": "^alpha$"
+  },
+  {
+    "id": "b-txt-created",
+    "desc": "b.txt exists with 'beta'.",
+    "kind": "sandbox-file-contains",
+    "path": "b.txt",
+    "pattern": "^beta$"
+  },
+  {
+    "id": "step-complete-called-exactly-twice",
+    "desc": "Exactly 2 step_complete calls (matching user's 2-step plan).",
+    "kind": "tool-call-count",
+    "tool": "step_complete",
+    "op": "eq",
+    "count": 2
+  },
+  {
+    "id": "update-goal-complete",
+    "desc": "Goal reaches completion.",
+    "kind": "tool-args-jq",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

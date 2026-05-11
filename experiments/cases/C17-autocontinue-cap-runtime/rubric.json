@@ -1,0 +1,29 @@
+[
+  {
+    "id": "propose-goal-draft-called",
+    "desc": "Agent proposes via propose_goal_draft.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "goal-file-paused",
+    "desc": "Goal file's status field is 'paused' after the cap fires.",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "\"status\"?\\s*:\\s*\"?paused"
+  },
+  {
+    "id": "pause-reason-cap-reached",
+    "desc": "Goal file's pauseReason mentions 'Auto-continue cap reached' (proves the cap mechanism fired, not user pause).",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "Auto-continue cap reached"
+  },
+  {
+    "id": "no-fake-complete",
+    "desc": "Agent must not have called update_goal=complete (the cap should have stopped it).",
+    "kind": "tool-args-jq-none",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

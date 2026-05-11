@@ -1,0 +1,49 @@
+[
+  {
+    "id": "create-goal-called-once",
+    "desc": "Agent should call create_goal exactly once (only in turn 1).",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": "true"
+  },
+  {
+    "id": "no-pause-goal",
+    "desc": "No pause_goal calls — tweak is a normal flow.",
+    "kind": "tool-not-called",
+    "tool": "pause_goal"
+  },
+  {
+    "id": "apply-goal-tweak-called",
+    "desc": "Tweak should be applied via the sanctioned apply_goal_tweak tool (the only schema-allowed channel).",
+    "kind": "tool-called",
+    "tool": "apply_goal_tweak"
+  },
+  {
+    "id": "apply-goal-tweak-mentions-extra-txt",
+    "desc": "apply_goal_tweak.newObjective should mention extra.txt (the added requirement).",
+    "kind": "tool-args-jq",
+    "tool": "apply_goal_tweak",
+    "jq": ".newObjective | test(\"extra\\\\.txt\")"
+  },
+  {
+    "id": "apply-goal-tweak-keeps-base-txt",
+    "desc": "apply_goal_tweak.newObjective should still mention base.txt (we expanded, not replaced).",
+    "kind": "tool-args-jq",
+    "tool": "apply_goal_tweak",
+    "jq": ".newObjective | test(\"base\\\\.txt\")"
+  },
+  {
+    "id": "goal-mentions-extra-txt",
+    "desc": "After tweak+execution, the goal file (active OR archived) should mention extra.txt.",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "extra\\.txt"
+  },
+  {
+    "id": "goal-still-has-base-txt",
+    "desc": "After tweak+execution, the goal file should still mention base.txt.",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "base\\.txt"
+  }
+]

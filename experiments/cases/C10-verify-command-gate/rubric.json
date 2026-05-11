@@ -1,0 +1,68 @@
+[
+  {
+    "id": "create-goal-sisyphus",
+    "desc": "create_goal called with sisyphus=true.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": ".sisyphus == true"
+  },
+  {
+    "id": "objective-has-3-steps",
+    "desc": "Objective must contain three numbered steps.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": "(.objective | test(\"\\\\b1[.)]\")) and (.objective | test(\"\\\\b2[.)]\")) and (.objective | test(\"\\\\b3[.)]\"))"
+  },
+  {
+    "id": "alpha-txt-content",
+    "desc": "alpha.txt must contain exactly 'hello'.",
+    "kind": "sandbox-file-contains",
+    "path": "alpha.txt",
+    "pattern": "^hello$"
+  },
+  {
+    "id": "beta-txt-content",
+    "desc": "beta.txt must contain exactly 'world'.",
+    "kind": "sandbox-file-contains",
+    "path": "beta.txt",
+    "pattern": "^world$"
+  },
+  {
+    "id": "gamma-txt-content",
+    "desc": "gamma.txt must contain exactly 'hello world'.",
+    "kind": "sandbox-file-contains",
+    "path": "gamma.txt",
+    "pattern": "^hello world$"
+  },
+  {
+    "id": "step-complete-called-3-times",
+    "desc": "step_complete must be called 3 times (once per step).",
+    "kind": "tool-call-count",
+    "tool": "step_complete",
+    "op": "ge",
+    "count": 3
+  },
+  {
+    "id": "all-step-completes-use-verifycommand",
+    "desc": "ALL 3 step_complete calls must include verifyCommand — the entire point of this test case.",
+    "kind": "tool-call-count",
+    "tool": "step_complete",
+    "argsJq": "(.verifyCommand // \"\") | length > 0",
+    "op": "ge",
+    "count": 3
+  },
+  {
+    "id": "step3-verifycommand-checks-content",
+    "desc": "Step 3 verifyCommand should reference gamma.txt (the merged file), proving content awareness.",
+    "kind": "tool-args-jq",
+    "tool": "step_complete",
+    "jq": ".stepIndex == 3 and ((.verifyCommand // \"\") | test(\"gamma\"))"
+  },
+  {
+    "id": "update-goal-complete",
+    "desc": "Agent should call update_goal=complete after all 3 verified steps.",
+    "kind": "tool-args-jq",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

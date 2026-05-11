@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 .pi/
 *.tgz
+experiments/
+package-lock.json
+tsconfig.json

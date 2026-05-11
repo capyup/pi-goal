@@ -1,0 +1,35 @@
+[
+  {
+    "id": "propose-goal-draft-called",
+    "desc": "Agent should propose a sisyphus goal.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "abort-was-fired",
+    "desc": "Drive emitted _drive_abort_scheduled (proves the harness fired abort).",
+    "kind": "raw-ndjson-contains",
+    "pattern": "_drive_abort_scheduled"
+  },
+  {
+    "id": "goal-file-paused",
+    "desc": "After abort, goal file's status must be 'paused' (proves pauseActiveGoal fired).",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "\"status\"?\\s*:\\s*\"?paused"
+  },
+  {
+    "id": "stop-reason-user",
+    "desc": "Pause due to abort should set stopReason='user' (user-initiated, not agent-pause).",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "\"stopReason\"?\\s*:\\s*\"?user"
+  },
+  {
+    "id": "no-fake-complete",
+    "desc": "Agent must not have called update_goal=complete (aborted before finishing).",
+    "kind": "tool-args-jq-none",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

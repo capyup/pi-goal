@@ -1,0 +1,50 @@
+[
+  {
+    "id": "propose-goal-draft-called",
+    "desc": "Agent should propose via propose_goal_draft.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "objective-is-sisyphus",
+    "desc": "sisyphus=true.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": ".sisyphus == true"
+  },
+  {
+    "id": "f1-created", "desc": "f1.txt exists with 'one'.",
+    "kind": "sandbox-file-contains", "path": "f1.txt", "pattern": "^one$"
+  },
+  {
+    "id": "f2-created", "desc": "f2.txt exists with 'two'.",
+    "kind": "sandbox-file-contains", "path": "f2.txt", "pattern": "^two$"
+  },
+  {
+    "id": "f3-created", "desc": "f3.txt exists with 'three'.",
+    "kind": "sandbox-file-contains", "path": "f3.txt", "pattern": "^three$"
+  },
+  {
+    "id": "f4-created", "desc": "f4.txt exists with 'four'.",
+    "kind": "sandbox-file-contains", "path": "f4.txt", "pattern": "^four$"
+  },
+  {
+    "id": "f5-created", "desc": "f5.txt exists with 'five'.",
+    "kind": "sandbox-file-contains", "path": "f5.txt", "pattern": "^five$"
+  },
+  {
+    "id": "step-complete-called-5-times",
+    "desc": "All 5 step_complete calls (one per step).",
+    "kind": "tool-call-count",
+    "tool": "step_complete",
+    "op": "ge",
+    "count": 5
+  },
+  {
+    "id": "update-goal-complete",
+    "desc": "Final completion after all 5 verified steps.",
+    "kind": "tool-args-jq",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

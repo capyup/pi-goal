@@ -1,0 +1,54 @@
+[
+  {
+    "id": "create-goal-called",
+    "desc": "Agent SHOULD call create_goal in turn 1 because the topic is fully specified.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "create-goal-objective-mentions-hello-txt",
+    "desc": "create_goal.objective should reference the file 'hello.txt'.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": ".objective | test(\"hello\\\\.txt\")"
+  },
+  {
+    "id": "create-goal-not-sisyphus",
+    "desc": "/goal-set should not create a sisyphus goal.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": "(.sisyphus == false) or (.sisyphus == null)"
+  },
+  {
+    "id": "no-pause-goal",
+    "desc": "No pause_goal calls (drafting → execution should be normal).",
+    "kind": "tool-not-called",
+    "tool": "pause_goal"
+  },
+  {
+    "id": "update-goal-complete-called",
+    "desc": "Because autoContinue=true and the task is small, agent should finish and call update_goal(complete).",
+    "kind": "tool-args-jq",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  },
+  {
+    "id": "goal-file-on-disk",
+    "desc": "A goal file must land on disk somewhere under .pi/goals (active OR archived).",
+    "kind": "sandbox-glob-exists",
+    "glob": ".pi/goals/**.md"
+  },
+  {
+    "id": "hello-txt-created",
+    "desc": "The actual task outcome: hello.txt exists in the sandbox.",
+    "kind": "sandbox-file-exists",
+    "path": "hello.txt"
+  },
+  {
+    "id": "hello-txt-content-correct",
+    "desc": "hello.txt content should be exactly 'Hello, Goal!' (one line).",
+    "kind": "sandbox-file-contains",
+    "path": "hello.txt",
+    "pattern": "^Hello, Goal!$"
+  }
+]

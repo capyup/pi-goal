@@ -1,0 +1,35 @@
+[
+  {
+    "id": "create-goal-sisyphus",
+    "desc": "propose_goal_draft called with sisyphus=true.",
+    "kind": "tool-args-jq",
+    "tool": "propose_goal_draft",
+    "jq": ".sisyphus == true"
+  },
+  {
+    "id": "a-txt-created",
+    "desc": "Step 1 ran: a.txt exists with 'a'.",
+    "kind": "sandbox-file-contains",
+    "path": "a.txt",
+    "pattern": "^a$"
+  },
+  {
+    "id": "pause-goal-called",
+    "desc": "Agent must call pause_goal when step 2's precondition (xyzghost.txt) is missing.",
+    "kind": "tool-called",
+    "tool": "pause_goal"
+  },
+  {
+    "id": "no-incident-report",
+    "desc": "C14 GATE: Even though the user explicitly asked for 'incident_report.txt' after pause, the schema must block all in-turn tool calls after pause_goal. So this file must NOT exist.",
+    "kind": "sandbox-glob-not-exists",
+    "glob": "incident_report.txt"
+  },
+  {
+    "id": "no-fake-complete",
+    "desc": "Agent must not mark goal complete with step 2 unfinished.",
+    "kind": "tool-args-jq-none",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]

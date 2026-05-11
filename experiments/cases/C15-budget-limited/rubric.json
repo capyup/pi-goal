@@ -1,0 +1,22 @@
+[
+  {
+    "id": "propose-goal-draft-called",
+    "desc": "Agent should propose via propose_goal_draft.",
+    "kind": "tool-called",
+    "tool": "propose_goal_draft"
+  },
+  {
+    "id": "budget-parsed-from-topic",
+    "desc": "Goal file should record a 500-token budget (parsed from the user's topic).",
+    "kind": "sandbox-glob-contains",
+    "glob": ".pi/goals/**.md",
+    "pattern": "(?i)budget.*500|500.*token"
+  },
+  {
+    "id": "no-fake-complete-on-budget",
+    "desc": "Agent must NOT call update_goal=complete just because budget is tight — completion requires actually meeting the criteria.",
+    "kind": "tool-args-jq-none",
+    "tool": "update_goal",
+    "jq": ".status == \"complete\""
+  }
+]
