@@ -237,3 +237,33 @@ export function mergeGoalPromptFromDisk(ctx: GoalFileContext, current: GoalRecor
 		return current;
 	}
 }
+
+export function readActiveGoalFiles(ctx: GoalFileContext): GoalRecord[] {
+	const root = path.resolve(ctx.cwd, GOALS_DIR);
+	let entries: string[];
+	try {
+		if (fs.lstatSync(root).isSymbolicLink()) return [];
+		entries = fs.readdirSync(root);
+	} catch {
+		return [];
+	}
+	return entries
+		.filter((name) => /^active_goal_.*\.md$/.test(name))
+		.sort((a, b) => a.localeCompare(b))
+		.map((name) => {
+			const relPath = `${GOALS_DIR}/${name}`;
+			if (!isSafeActivePath(ctx, relPath)) return null;
+			const parsed = parseGoalFile(resolveGoalPath(ctx, GOALS_DIR, relPath));
+			if (!parsed || parsed.status === "complete") return null;
+			return sanitizeGoalPaths(ctx, { ...parsed, activePath: relPath });
+		})
+		.filter((goal): goal is GoalRecord => goal !== null);
+}
+
+export function readActiveGoalPool(ctx: GoalFileContext): Map<string, GoalRecord> {
+	const pool = new Map<string, GoalRecord>();
+	for (const goal of readActiveGoalFiles(ctx)) {
+		pool.set(goal.id, goal);
+	}
+	return pool;
+}

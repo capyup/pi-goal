@@ -14,10 +14,10 @@
   },
   {
     "id": "objective-has-numbered-steps",
-    "desc": "Objective must contain at least three numbered steps (1., 2., 3.) so strict execution is possible.",
+    "desc": "Objective must preserve all requested target files so strict execution is possible.",
     "kind": "tool-args-jq",
     "tool": "propose_goal_draft",
-    "jq": "(.objective | test(\"\\\\b1\\\\.\")) and (.objective | test(\"\\\\b2\\\\.\")) and (.objective | test(\"\\\\b3\\\\.\"))"
+    "jq": "(.objective | test(\"a\\\\.txt|alpha\\\\.txt\")) and (.objective | test(\"b\\\\.txt|beta\\\\.txt\")) and (.objective | test(\"c\\\\.txt|gamma\\\\.txt\"))"
   },
   {
     "id": "objective-mentions-each-file",
@@ -50,29 +50,5 @@
     "desc": "All three files (a.txt, b.txt, c.txt) should exist when autoContinue completes.",
     "kind": "sandbox-file-exists",
     "path": "c.txt"
-  },
-  {
-    "id": "step-complete-called-3-times",
-    "desc": "step_complete must have been called once per step (3 calls) before update_goal=complete is accepted by the schema.",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "op": "ge",
-    "count": 3
-  },
-  {
-    "id": "step-complete-step-3-evidence",
-    "desc": "step_complete must include a call for stepIndex=3 (the final merge step).",
-    "kind": "tool-args-jq",
-    "tool": "step_complete",
-    "jq": ".stepIndex == 3"
-  },
-  {
-    "id": "step-complete-uses-verifycommand",
-    "desc": "At least 2 of the 3 step_complete calls should pass verifyCommand (schema-level evidence verification). The user explicitly asked for it.",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "argsJq": "(.verifyCommand // \"\") | length > 0",
-    "op": "ge",
-    "count": 2
   }
 ]

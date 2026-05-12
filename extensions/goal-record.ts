@@ -2,6 +2,7 @@ export type GoalStatus = "active" | "paused" | "budgetLimited" | "complete";
 export type StopReason = "user" | "agent";
 export type GoalEventKind = "checkpoint" | "stale" | "budget_limit" | "drafting";
 export type DraftingFocus = "goal" | "sisyphus";
+export type GoalFocusReason = "created" | "selected" | "resumed" | "completed" | "cleared" | "aborted" | "migrated";
 
 export interface GoalUsage {
 	tokensUsed: number;
@@ -29,6 +30,12 @@ export interface GoalRecord {
 export interface GoalStateEntry {
 	version: 3;
 	goal: GoalRecord | null;
+}
+
+export interface GoalFocusEntry {
+	version: 1;
+	focusedGoalId: string | null;
+	reason: GoalFocusReason;
 }
 
 export interface GoalEventDetails {
@@ -86,6 +93,27 @@ export function emptyUsage(): GoalUsage {
 
 export function cloneGoal(goal: GoalRecord): GoalRecord {
 	return { ...goal, usage: { ...goal.usage } };
+}
+
+export function goalFocusDetails(focusedGoalId: string | null, reason: GoalFocusReason): GoalFocusEntry {
+	return {
+		version: 1,
+		focusedGoalId: focusedGoalId ? safeIdPart(focusedGoalId) : null,
+		reason,
+	};
+}
+
+export function normalizeGoalFocusEntry(value: unknown): GoalFocusEntry | null {
+	const raw = asRecord(value);
+	if (!raw || raw.version !== 1) return null;
+	const focusedGoalId = typeof raw.focusedGoalId === "string" && raw.focusedGoalId.trim()
+		? safeIdPart(raw.focusedGoalId)
+		: null;
+	const reason: GoalFocusReason =
+		raw.reason === "created" || raw.reason === "selected" || raw.reason === "resumed" || raw.reason === "completed" || raw.reason === "cleared" || raw.reason === "aborted" || raw.reason === "migrated"
+			? raw.reason
+			: "selected";
+	return { version: 1, focusedGoalId, reason };
 }
 
 export function createGoal(config: GoalCreationConfig, now = Date.now()): GoalRecord {

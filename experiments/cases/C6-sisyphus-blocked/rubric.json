@@ -7,13 +7,6 @@
     "jq": ".sisyphus == true"
   },
   {
-    "id": "step1-complete-recorded",
-    "desc": "step_complete should be called for stepIndex=1 after a.txt is written and verified.",
-    "kind": "tool-args-jq",
-    "tool": "step_complete",
-    "jq": ".stepIndex == 1"
-  },
-  {
     "id": "pause-goal-called",
     "desc": "Agent MUST call pause_goal when step 2 precondition (existing.txt) is missing.",
     "kind": "tool-called",

@@ -12,6 +12,14 @@
     "tool": "pause_goal"
   },
   {
+    "id": "no-get-goal-loop",
+    "desc": "Agent should not loop on get_goal instead of attempting the request or pausing.",
+    "kind": "tool-call-count",
+    "tool": "get_goal",
+    "op": "le",
+    "count": 1
+  },
+  {
     "id": "pause-reason-non-empty",
     "desc": "pause_goal.reason should be a non-empty string explaining the blocker.",
     "kind": "tool-args-jq",

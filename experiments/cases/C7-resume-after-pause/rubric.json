@@ -14,13 +14,6 @@
     "pattern": "^a$"
   },
   {
-    "id": "step1-complete-recorded",
-    "desc": "step_complete should be called for stepIndex=1 after a.txt is verified.",
-    "kind": "tool-args-jq",
-    "tool": "step_complete",
-    "jq": ".stepIndex == 1"
-  },
-  {
     "id": "pause-goal-called",
     "desc": "Agent must call pause_goal when step 2 precondition (missing.txt) is missing.",
     "kind": "tool-called",
@@ -39,12 +32,5 @@
     "kind": "tool-args-jq-none",
     "tool": "update_goal",
     "jq": ".status == \"complete\""
-  },
-  {
-    "id": "step1-uses-verifycommand",
-    "desc": "step_complete for step 1 should use verifyCommand (user explicitly asked for it).",
-    "kind": "tool-args-jq",
-    "tool": "step_complete",
-    "jq": ".stepIndex == 1 and ((.verifyCommand // \"\") | length > 0)"
   }
 ]

@@ -58,3 +58,13 @@ test("renderGoalWidgetLines highlights agent blockers and suggested action", () 
 	assert.match(lines.join("\n"), /^├─ blocker Missing API token/m);
 	assert.match(lines.join("\n"), /^├─ next Set TOKEN and run \/goal-resume/m);
 });
+
+test("renderGoalWidgetLines shows other open goals and unfocused multi-goal guidance", () => {
+	const focused = renderGoalWidgetLines(goal(), theme, 100, { openGoalCount: 3 });
+	assert.match(focused[0], /\+2 open/);
+
+	const unfocused = renderGoalWidgetLines(null, theme, 100, { openGoalCount: 2 });
+	assert.match(unfocused[0], /^◇ Goal unfocused/);
+	assert.match(unfocused[0], /2 open/);
+	assert.match(unfocused.join("\n"), /\/goal-focus/);
+});

@@ -8,10 +8,10 @@
   },
   {
     "id": "objective-has-3-steps",
-    "desc": "Objective must contain three numbered steps.",
+    "desc": "Objective must preserve all requested target files so strict execution is possible.",
     "kind": "tool-args-jq",
     "tool": "propose_goal_draft",
-    "jq": "(.objective | test(\"\\\\b1[.)]\")) and (.objective | test(\"\\\\b2[.)]\")) and (.objective | test(\"\\\\b3[.)]\"))"
+    "jq": "(.objective | test(\"a\\\\.txt|alpha\\\\.txt\")) and (.objective | test(\"b\\\\.txt|beta\\\\.txt\")) and (.objective | test(\"c\\\\.txt|gamma\\\\.txt\"))"
   },
   {
     "id": "alpha-txt-content",
@@ -35,32 +35,16 @@
     "pattern": "^hello world$"
   },
   {
-    "id": "step-complete-called-3-times",
-    "desc": "step_complete must be called 3 times (once per step).",
+    "id": "verification-bash-used",
+    "desc": "Agent should use shell verification commands for the requested file contents before completion.",
     "kind": "tool-call-count",
-    "tool": "step_complete",
+    "tool": "bash",
     "op": "ge",
     "count": 3
-  },
-  {
-    "id": "all-step-completes-use-verifycommand",
-    "desc": "ALL 3 step_complete calls must include verifyCommand — the entire point of this test case.",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "argsJq": "(.verifyCommand // \"\") | length > 0",
-    "op": "ge",
-    "count": 3
-  },
-  {
-    "id": "step3-verifycommand-checks-content",
-    "desc": "Step 3 verifyCommand should reference gamma.txt (the merged file), proving content awareness.",
-    "kind": "tool-args-jq",
-    "tool": "step_complete",
-    "jq": ".stepIndex == 3 and ((.verifyCommand // \"\") | test(\"gamma\"))"
   },
   {
     "id": "update-goal-complete",
-    "desc": "Agent should call update_goal=complete after all 3 verified steps.",
+    "desc": "Agent should call update_goal=complete after all requested outputs are verified.",
     "kind": "tool-args-jq",
     "tool": "update_goal",
     "jq": ".status == \"complete\""

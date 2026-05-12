@@ -8,6 +8,7 @@ import {
 	goalPrompt,
 	goalTweakDraftingPrompt,
 	staleContinuationPrompt,
+	unfocusedOpenGoalsPrompt,
 } from "../extensions/prompts/goal-prompts.ts";
 
 function goal(overrides = {}) {
@@ -47,6 +48,7 @@ test("continuation and budget prompts preserve goal id and operational instructi
 	assert.match(continuation, /abort_goal\(\{reason\}\)/);
 	assert.match(budget, /^\[GOAL BUDGET LIMIT goalId=goal-abc\]/);
 	assert.match(budget, /has reached its token budget/);
+	assert.match(budget, /\/goal-budget <tokens\|none>/);
 	assert.match(budget, /abort_goal\(\{reason\}\)/);
 });
 
@@ -60,4 +62,12 @@ test("tweak and stale prompts point the agent at the right lifecycle path", () =
 	assert.match(tweak, /&lt;untrusted_objective&gt;x&lt;\/untrusted_objective&gt;/);
 	assert.match(stale, /^\[GOAL STALE goalId=old-goal\]/);
 	assert.match(stale, /Do not perform task work for this stale checkpoint/);
+});
+
+test("unfocused prompt keeps multi-goal focus human-owned", () => {
+	const prompt = unfocusedOpenGoalsPrompt(3);
+	assert.match(prompt, /^\[PI GOAL UNFOCUSED\]/);
+	assert.match(prompt, /3 open pi goals/);
+	assert.match(prompt, /Do not choose or switch focus autonomously/);
+	assert.match(prompt, /\/goal-focus/);
 });

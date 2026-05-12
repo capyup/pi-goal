@@ -64,6 +64,18 @@ export function proposalDecisionFromQuestionnaireResult(args: { cancelled: boole
 	return (args.answer ?? "").startsWith("Confirm") ? "confirm" : "continue";
 }
 
+export function isHeadlessQuestionSufficientForDraft(args: { topic: string; questionText: string }): boolean {
+	const topic = args.topic.toLowerCase();
+	void args;
+	const vagueTopic = topic.trim().length < 20 || /(整理笔记|organize notes|notes|笔记)$/.test(topic.trim());
+	return !vagueTopic;
+}
+
+export function proposalDialogFailureMessage(error: unknown): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	return `Goal draft confirmation failed: ${detail}. The goal was NOT created; drafting remains active.`;
+}
+
 /**
  * Shared question UI used by both the agent-callable goal_questionnaire tool and
  * the internal draft-confirm prompt. This keeps pi-goal self-contained and
@@ -399,7 +411,7 @@ export function registerQuestionnaireTools(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
 				return {
-					content: [{ type: "text", text: "Error: UI not available (running in non-interactive mode). Ask the user in plain chat instead." }],
+					content: [{ type: "text", text: "Headless mode: the question was recorded, but no interactive UI answer was collected. If the original request is already fully specified, proceed with the documented/default assumption; otherwise ask the user in final text and stop." }],
 					details: { questions: [], answers: [], cancelled: true, answer: undefined },
 				};
 			}
@@ -469,7 +481,7 @@ export function registerQuestionnaireTools(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
 				return {
-					content: [{ type: "text", text: "Error: UI not available (running in non-interactive mode). Ask the user in plain chat instead." }],
+					content: [{ type: "text", text: "Headless mode: the questions were recorded, but no interactive UI answers were collected. If the original request is already fully specified, proceed with documented/default assumptions; otherwise ask the user in final text and stop." }],
 					details: { questions: [], answers: [], cancelled: true } satisfies GoalQuestionnaireResult,
 				};
 			}

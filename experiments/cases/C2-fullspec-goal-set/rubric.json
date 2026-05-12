@@ -33,6 +33,14 @@
     "jq": ".status == \"complete\""
   },
   {
+    "id": "no-get-goal-loop",
+    "desc": "Agent should not loop on get_goal instead of doing the file work.",
+    "kind": "tool-call-count",
+    "tool": "get_goal",
+    "op": "le",
+    "count": 1
+  },
+  {
     "id": "goal-file-on-disk",
     "desc": "A goal file must land on disk somewhere under .pi/goals (active OR archived).",
     "kind": "sandbox-glob-exists",

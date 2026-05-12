@@ -15,10 +15,13 @@ import {
 	buildDraftConfirmationText,
 	evaluateDraftingToolGate,
 	goalDraftingPrompt,
+	validateDraftPromptIdentity,
 	validateGoalDraftProposal,
 	type GoalDraftingFocus,
 } from "./goal-draft.ts";
 import {
+	isHeadlessQuestionSufficientForDraft,
+	proposalDialogFailureMessage,
 	registerQuestionnaireTools,
 	shouldAutoConfirmProposal,
 	showProposalDialog,
@@ -32,8 +35,8 @@ import {
 	QUESTIONNAIRE_TOOL_NAME,
 	QUESTION_TOOL_NAME,
 	SISYPHUS_STEP_TOOL_NAME,
-	GOAL_WORK_TOOL_NAMES,
-	PAUSED_GOAL_TOOL_NAMES,
+	GOAL_PROGRESS_TOOL_NAMES,
+	lifecycleToolNamesForGoalStatus,
 	TWEAK_APPLY_TOOL_NAME,
 	isQuestionLikeToolName,
 } from "./goal-tool-names.ts";
@@ -41,10 +44,14 @@ import {
 	asRecord,
 	cloneGoal,
 	createGoal,
+	goalFocusDetails,
 	normalizeGoalRecord,
+	normalizeGoalFocusEntry,
 	nowIso,
 	type AssistantMessageLike,
 	type DraftingFocus,
+	type GoalFocusEntry,
+	type GoalFocusReason,
 	type GoalCreationConfig,
 	type GoalEventDetails,
 	type GoalEventKind,
@@ -56,9 +63,20 @@ import {
 import {
 	archiveGoalFile,
 	mergeGoalPromptFromDisk,
+	readActiveGoalPool,
 	sanitizeGoalPaths,
 	writeActiveGoalFile,
 } from "./storage/goal-files.ts";
+import {
+	buildGoalListText,
+	buildUnfocusedOpenGoalsSummary,
+	focusedGoalFromPool,
+	goalSelectorLabel,
+	mergeFocusedGoalWithDisk,
+	openGoalsFromPool,
+	otherOpenGoalCount,
+	resolveSessionFocus,
+} from "./goal-pool.ts";
 import {
 	budgetBlock,
 	budgetLimitPrompt,
@@ -66,6 +84,7 @@ import {
 	goalPrompt,
 	goalTweakDraftingPrompt,
 	staleContinuationPrompt,
+	unfocusedOpenGoalsPrompt,
 	untrustedObjectiveBlock,
 } from "./prompts/goal-prompts.ts";
 import { buildGoalRunningNotification } from "./widgets/goal-notifications.ts";
@@ -73,12 +92,14 @@ import { GoalWidgetComponent } from "./widgets/goal-widget.ts";
 
 import {
 	abortGoalCommandMessage,
+	applyGoalBudgetUpdate,
 	buildAbortedByAgentGoal,
 	buildAutoContinueCapPause,
 	buildCompletionReport,
 	buildGoalCreatedReport,
 	buildPausedByAgentGoal,
 	clearGoalCommandMessage,
+	parseGoalBudgetUpdate,
 	shouldArmPostCompactReminder,
 	shouldAutoPauseForContinueCap,
 	shouldInjectPostCompactReminder,
@@ -90,6 +111,7 @@ import {
 } from "./goal-policy.ts";
 
 const STATE_ENTRY = "pi-goal-state";
+const FOCUS_ENTRY = "pi-goal-focus";
 const GOAL_EVENT_ENTRY = "pi-goal-event";
 const COMPLETE_STATUS = "complete";
 const CONTINUATION_IDLE_RETRY_MS = 50;
@@ -113,7 +135,7 @@ const MAX_AUTOCONTINUE_TURNS = (() => {
  * turn ends without any of these having been called, we DO NOT queue the next
  * autoContinue — the agent was just chatting. This stops infinite chat loops.
  */
-const GOAL_WORK_TOOL_SET = new Set<string>(GOAL_WORK_TOOL_NAMES);
+const GOAL_PROGRESS_TOOL_SET = new Set<string>(GOAL_PROGRESS_TOOL_NAMES);
 
 
 /**
@@ -150,6 +172,7 @@ interface DraftingState {
 	questionsAsked: number;
 }
 let draftingFor: DraftingState | null = null;
+const draftingNudgesByDraftId = new Map<string, number>();
 
 /**
  * Parsed token budget from the user's initial topic, to be injected automatically
@@ -289,6 +312,11 @@ function extractGoalIdFromInjectedMessage(text: string): string | null {
 	return match?.[1] ?? null;
 }
 
+function extractDraftIdFromInjectedMessage(text: string): string | null {
+	const match = text.match(/^\[GOAL DRAFTING\b[^\]]*\bdraftId=([^\]\s]+)/);
+	return match?.[1] ?? null;
+}
+
 function goalEventMessageId(message: { customType?: string; details?: unknown; content?: unknown }): string | null {
 	if (message.customType !== GOAL_EVENT_ENTRY) return null;
 	const details = asRecord(message.details);
@@ -326,10 +354,38 @@ function assistantTurnTokens(message: unknown): number {
 	return usageChannelTokens(usage.input) + usageChannelTokens(usage.output);
 }
 
+function isMeaningfulProgressToolCall(toolName: string, args: unknown): boolean {
+	if (!GOAL_PROGRESS_TOOL_SET.has(toolName)) return false;
+		if (toolName === "read") {
+			const path = asRecord(args)?.path;
+			if (typeof path === "string" && (path === ".pi/goals" || path.startsWith(".pi/goals/"))) return false;
+		}
+		if (toolName === "bash") {
+			const command = asRecord(args)?.command;
+			if (typeof command === "string" && /^\s*echo\b/.test(command)) return false;
+		}
+	return true;
+}
+
 // ---------- extension entry point ----------
 
 export default function goalExtension(pi: ExtensionAPI): void {
-	let goal: GoalRecord | null = null;
+	let goalsById = new Map<string, GoalRecord>();
+	let focusedGoalId: string | null = null;
+	const state = {
+		get goal(): GoalRecord | null {
+			return focusedGoalFromPool(goalsById, focusedGoalId);
+		},
+		set goal(next: GoalRecord | null) {
+			if (next) {
+				goalsById.set(next.id, next);
+				focusedGoalId = next.id;
+				return;
+			}
+			if (focusedGoalId) goalsById.delete(focusedGoalId);
+			focusedGoalId = null;
+		},
+	};
 	let continuationQueuedFor: string | null = null;
 	let continuationScheduledFor: string | null = null;
 	let continuationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -338,10 +394,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let statusRefreshTimer: ReturnType<typeof setInterval> | null = null;
 	let statusRefreshCtx: ExtensionContext | null = null;
 
-	// Per-active-goal counter for the autoContinue hard cap (#3).
+	// Per-goal counter for the autoContinue hard cap (#3).
 	// Increments each time sendQueuedContinuation actually delivers a continuation.
-	// Reset on: new goal, user-initiated turn, goal clear, goal pause, goal complete.
-	let autoContinueTurns = 0;
+	const autoContinueTurnsByGoalId = new Map<string, number>();
+	const activeGetGoalTurnsByGoalId = new Map<string, number>();
 	let autoContinueLimitWarnedFor: string | null = null;
 
 	// Per-turn flags reset in turn_start (#4, C9 fix).
@@ -365,15 +421,29 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		budgetWarningSentFor: null as string | null,
 	};
 
+	const draftingHiddenWorkTools = [
+		"bash",
+		"read",
+		"write",
+		"edit",
+		"grep",
+		"find",
+		"ls",
+		SISYPHUS_STEP_TOOL_NAME,
+		TWEAK_APPLY_TOOL_NAME,
+		CREATE_GOAL_TOOL_NAME,
+	] as const;
+	const goalExecutionWorkTools = ["read", "bash", "edit", "write"] as const;
+
 	function syncGoalTools(): void {
 		try {
 			const active = new Set(pi.getActiveTools());
-			active.add(QUESTION_TOOL_NAME);
-			active.add(QUESTIONNAIRE_TOOL_NAME);
-			const goalRunning = goal?.status === "active" || goal?.status === "budgetLimited";
-			const goalPaused = goal?.status === "paused";
+			for (const name of goalExecutionWorkTools) active.add(name);
+			active.delete(QUESTION_TOOL_NAME);
+			active.delete(QUESTIONNAIRE_TOOL_NAME);
 			for (const name of ACTIVE_GOAL_TOOL_NAMES) active.delete(name);
-			const lifecycleTools = goalRunning ? ACTIVE_GOAL_TOOL_NAMES : goalPaused ? PAUSED_GOAL_TOOL_NAMES : [];
+			const phase = draftingFor !== null ? "drafting" : tweakDraftingFor !== null ? "tweakDrafting" : "normal";
+			const lifecycleTools = lifecycleToolNamesForGoalStatus(state.goal?.status, phase);
 			for (const name of lifecycleTools) active.add(name);
 			// Sisyphus is now a prompt/criteria style, not a separate step-counter
 			// mechanism. Keep step_complete registered for legacy transcripts, but do
@@ -381,7 +451,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			active.delete(SISYPHUS_STEP_TOOL_NAME);
 			// apply_goal_tweak is only available during a /goal-tweak drafting flow.
 			// Note: tweak drafting can run against active OR paused goals.
-			if (goal && tweakDraftingFor === goal.id) {
+			if (state.goal && tweakDraftingFor === state.goal.id) {
 				active.add(TWEAK_APPLY_TOOL_NAME);
 				active.add(QUESTION_TOOL_NAME);
 				active.add(QUESTIONNAIRE_TOOL_NAME);
@@ -393,15 +463,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// the agent through the confirm dialog). Outside drafting, neither
 			// is shown until a /goal-* command starts a new flow.
 			if (draftingFor !== null) {
-				active.add(PROPOSE_DRAFT_TOOL_NAME);
+				for (const name of draftingHiddenWorkTools) active.delete(name);
+				const canPropose = draftingFor.questionsAsked > 0
+					|| isHeadlessQuestionSufficientForDraft({ topic: draftingFor.originalTopic, questionText: "" });
+				if (canPropose) active.add(PROPOSE_DRAFT_TOOL_NAME);
+				else active.delete(PROPOSE_DRAFT_TOOL_NAME);
+				active.add(QUESTION_TOOL_NAME);
 				active.add(QUESTIONNAIRE_TOOL_NAME);
-				active.delete(CREATE_GOAL_TOOL_NAME);
 			} else {
 				active.delete(PROPOSE_DRAFT_TOOL_NAME);
 				// Outside drafting, create_goal stays hidden too — the user must
 				// invoke /goal-set or /goal-sisyphus first. This kills the "agent
 				// silently creates a goal from a casual message" failure mode.
 				active.delete(CREATE_GOAL_TOOL_NAME);
+				if (state.goal?.status === "active") {
+					for (const name of goalExecutionWorkTools) active.add(name);
+				}
 			}
 			pi.setActiveTools(Array.from(active));
 		} catch {}
@@ -416,19 +493,22 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function syncStatusRefresh(ctx: ExtensionContext): void {
-		if (!ctx.hasUI || goal?.status !== "active") {
+		if (!ctx.hasUI || state.goal?.status !== "active") {
 			stopStatusRefresh();
 			return;
 		}
 		statusRefreshCtx = ctx;
 		if (statusRefreshTimer) return;
 		statusRefreshTimer = setInterval(() => {
-			if (!statusRefreshCtx || goal?.status !== "active") {
+			if (!statusRefreshCtx || state.goal?.status !== "active") {
 				stopStatusRefresh();
 				return;
 			}
 			const displayGoal = goalForDisplay();
-			if (displayGoal) statusRefreshCtx.ui.setStatus("goal", footerStatus(displayGoal));
+			if (displayGoal) {
+				const otherCount = otherOpenGoalCount(goalsById, focusedGoalId);
+				statusRefreshCtx.ui.setStatus("goal", `${footerStatus(displayGoal)}${otherCount > 0 ? ` (+${otherCount} open)` : ""}`);
+			}
 			// Live-tick the above-editor widget so duration/tokens update.
 			goalWidgetComponent?.update();
 		}, STATUS_REFRESH_MS);
@@ -458,22 +538,123 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		clearActiveAccounting();
 	}
 
+	function resetAutoContinueCap(goalId: string | null | undefined): void {
+		if (goalId) {
+			autoContinueTurnsByGoalId.delete(goalId);
+			activeGetGoalTurnsByGoalId.delete(goalId);
+		}
+		autoContinueLimitWarnedFor = null;
+	}
+
+	function openGoals(): GoalRecord[] {
+		return openGoalsFromPool(goalsById);
+	}
+
+	function reconcileFocusedGoalFromDisk(ctx: ExtensionContext, opts: { preserveMemoryUsage?: boolean } = {}): boolean {
+		const current = state.goal;
+		const fresh = readActiveGoalPool(ctx);
+		if (!focusedGoalId) {
+			goalsById = fresh;
+			return true;
+		}
+		const diskGoal = fresh.get(focusedGoalId) ?? null;
+		if (!diskGoal) {
+			if (current && !current.activePath) {
+				goalsById = fresh;
+				goalsById.set(current.id, current);
+				focusedGoalId = current.id;
+				return true;
+			}
+			goalsById = fresh;
+			focusedGoalId = null;
+			clearStoppedRuntimeState();
+			accounting.budgetWarningSentFor = null;
+			if (current) resetAutoContinueCap(current.id);
+			if (tweakDraftingFor !== null) tweakDraftingFor = null;
+			syncGoalTools();
+			updateUI(ctx);
+			return false;
+		}
+		const reconciled = current && opts.preserveMemoryUsage
+			? mergeFocusedGoalWithDisk({ memoryGoal: current, diskGoal })
+			: diskGoal;
+		goalsById = fresh;
+		goalsById.set(reconciled.id, reconciled);
+		focusedGoalId = reconciled.id;
+		if (reconciled.status !== "active" || !reconciled.autoContinue) clearContinuationState();
+		if (reconciled.status !== "active" && reconciled.status !== "budgetLimited") clearActiveAccounting();
+		return true;
+	}
+
+	function appendFocusEntry(goalId: string | null, reason: GoalFocusReason): void {
+		pi.appendEntry(FOCUS_ENTRY, goalFocusDetails(goalId, reason));
+	}
+
+	function setFocusedGoalId(goalId: string | null, ctx: ExtensionContext, reason: GoalFocusReason): void {
+		const previousGoalId = focusedGoalId;
+		focusedGoalId = goalId && goalsById.has(goalId) ? goalId : null;
+		if (previousGoalId !== focusedGoalId) {
+			clearContinuationState();
+			clearActiveAccounting();
+			accounting.budgetWarningSentFor = null;
+			resetAutoContinueCap(previousGoalId);
+			resetAutoContinueCap(focusedGoalId);
+			if (tweakDraftingFor !== null && tweakDraftingFor !== focusedGoalId) tweakDraftingFor = null;
+		}
+		appendFocusEntry(focusedGoalId, reason);
+		syncGoalTools();
+		updateUI(ctx);
+	}
+
+	function updateFocusedGoal(next: GoalRecord, ctx: ExtensionContext, shouldPersist = true): void {
+		const previousGoalId = focusedGoalId;
+		goalsById.set(next.id, next);
+		focusedGoalId = next.id;
+		if (previousGoalId !== focusedGoalId) {
+			resetAutoContinueCap(previousGoalId);
+			resetAutoContinueCap(focusedGoalId);
+		}
+		if (shouldPersist) persist(ctx);
+		else syncGoalTools();
+		updateUI(ctx);
+	}
+
+	function armFocusedContinuation(ctx: ExtensionContext): void {
+		beginAccounting();
+		if (state.goal?.status === "active" && state.goal.autoContinue) queueContinuation(ctx, true);
+	}
+
+	function removeFocusedGoal(ctx: ExtensionContext, reason: GoalFocusReason): void {
+		const previousGoalId = focusedGoalId;
+		if (focusedGoalId) goalsById.delete(focusedGoalId);
+		focusedGoalId = null;
+		clearStoppedRuntimeState();
+		resetAutoContinueCap(previousGoalId);
+		appendFocusEntry(null, reason);
+		syncGoalTools();
+		updateUI(ctx);
+	}
+
 	function beginAccounting(): void {
-		if (!goal || (goal.status !== "active" && goal.status !== "budgetLimited")) {
+		if (draftingFor !== null || tweakDraftingFor !== null) {
 			clearActiveAccounting();
 			return;
 		}
-		accounting.activeGoalId = goal.id;
+		if (!state.goal || (state.goal.status !== "active" && state.goal.status !== "budgetLimited")) {
+			clearActiveAccounting();
+			return;
+		}
+		accounting.activeGoalId = state.goal.id;
 		accounting.lastAccountedAt = Date.now();
 	}
 
 	function goalForDisplay(): GoalRecord | null {
-		if (!goal || goal.status !== "active" || accounting.activeGoalId !== goal.id || accounting.lastAccountedAt === null) {
-			return goal;
+		if (!state.goal || state.goal.status !== "active" || accounting.activeGoalId !== state.goal.id || accounting.lastAccountedAt === null) {
+			return state.goal;
 		}
 		const liveSeconds = Math.max(0, Math.floor((Date.now() - accounting.lastAccountedAt) / 1000));
-		if (liveSeconds === 0) return goal;
-		const live = cloneGoal(goal);
+		if (liveSeconds === 0) return state.goal;
+		const live = cloneGoal(state.goal);
 		live.usage.activeSeconds += liveSeconds;
 		return live;
 	}
@@ -482,10 +663,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		opts: { allowBudgetSteering: boolean; completedTurnTokens?: number; accountBudgetLimited?: boolean },
 	): void {
+		if (draftingFor !== null || tweakDraftingFor !== null) {
+			clearActiveAccounting();
+			return;
+		}
+		if (state.goal?.activePath && !reconcileFocusedGoalFromDisk(ctx, { preserveMemoryUsage: true })) return;
 		const canAccount =
-			goal?.status === "active"
-			|| (opts.accountBudgetLimited === true && goal?.status === "budgetLimited");
-		if (!goal || !canAccount || accounting.activeGoalId !== goal.id) {
+			state.goal?.status === "active"
+			|| (opts.accountBudgetLimited === true && state.goal?.status === "budgetLimited");
+		if (!state.goal || !canAccount || accounting.activeGoalId !== state.goal.id) {
 			beginAccounting();
 			return;
 		}
@@ -497,14 +683,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const tokens = Math.max(0, Math.trunc(opts.completedTurnTokens ?? 0));
 		if (tokens === 0 && elapsedSeconds === 0) return;
 
-		const wasUnderBudget = goal.tokenBudget === null || goal.usage.tokensUsed < goal.tokenBudget;
-		const next = cloneGoal(goal);
+		const wasUnderBudget = state.goal.tokenBudget === null || state.goal.usage.tokensUsed < state.goal.tokenBudget;
+		const next = cloneGoal(state.goal);
 		next.usage.tokensUsed += tokens;
 		next.usage.activeSeconds += elapsedSeconds;
 		next.updatedAt = nowIso();
 		const newStatus = statusAfterBudgetLimit(next);
 		next.status = newStatus;
-		goal = next;
+		state.goal = next;
 		persist(ctx);
 
 		const crossedBudget =
@@ -536,30 +722,32 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function syncGoalPromptFromDisk(ctx: ExtensionContext): boolean {
-		if (!goal || goal.status === "complete") return false;
-		const previousObjective = goal.objective;
-		goal = mergeGoalPromptFromDisk(ctx, goal);
-		return goal.objective !== previousObjective;
+		if (!state.goal || state.goal.status === "complete") return false;
+		const previousObjective = state.goal.objective;
+		state.goal = mergeGoalPromptFromDisk(ctx, state.goal);
+		return state.goal.objective !== previousObjective;
 	}
 
 	function persist(ctx?: ExtensionContext): void {
-		if (goal) {
-			goal = { ...goal, updatedAt: nowIso() };
+		const current = state.goal;
+		if (current) {
+			state.goal = { ...current, updatedAt: nowIso() };
 			if (ctx) {
 				syncGoalPromptFromDisk(ctx);
-				goal = goal.status === "complete" ? archiveGoalFile(ctx, goal) : writeActiveGoalFile(ctx, goal);
+				const next = state.goal;
+				if (next) state.goal = next.status === "complete" ? archiveGoalFile(ctx, next) : writeActiveGoalFile(ctx, next);
 			}
 		}
-		pi.appendEntry(STATE_ENTRY, goalDetails(goal));
+		pi.appendEntry(STATE_ENTRY, goalDetails(state.goal));
 		syncGoalTools();
 		if (ctx) updateUI(ctx);
 	}
 
 	function refreshGoalDisplayFromDisk(ctx: ExtensionContext): void {
-		if (!goal || goal.status === "complete") return;
+		if (!state.goal || state.goal.status === "complete") return;
 		if (syncGoalPromptFromDisk(ctx)) {
-			goal = { ...goal, updatedAt: nowIso() };
-			pi.appendEntry(STATE_ENTRY, goalDetails(goal));
+			state.goal = { ...state.goal, updatedAt: nowIso() };
+			pi.appendEntry(STATE_ENTRY, goalDetails(state.goal));
 		}
 		syncGoalTools();
 		updateUI(ctx);
@@ -597,14 +785,39 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	function updateUI(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
-		if (!goal) {
+		const totalOpen = openGoals().length;
+		if (!state.goal && totalOpen === 0) {
 			clearGoalWidget(ctx);
 			stopStatusRefresh();
 			return;
 		}
+		if (!state.goal) {
+			ctx.ui.setStatus("goal", `goal: unfocused [${totalOpen} open] - /goal-focus`);
+			if (!widgetRegistered) {
+				ctx.ui.setWidget(
+					GOAL_WIDGET_KEY,
+					(tui, theme) => {
+						goalWidgetComponent = new GoalWidgetComponent({
+							tui,
+							theme,
+							getGoal: () => goalForDisplay() ?? state.goal,
+							getOpenGoalCount: () => openGoals().length,
+						});
+						return goalWidgetComponent;
+					},
+					{ placement: "aboveEditor" },
+				);
+				widgetRegistered = true;
+			} else {
+				goalWidgetComponent?.update();
+			}
+			stopStatusRefresh();
+			return;
+		}
 
-		const displayGoal = goalForDisplay() ?? goal;
-		ctx.ui.setStatus("goal", footerStatus(displayGoal));
+		const displayGoal = goalForDisplay() ?? state.goal;
+		const otherCount = otherOpenGoalCount(goalsById, focusedGoalId);
+		ctx.ui.setStatus("goal", `${footerStatus(displayGoal)}${otherCount > 0 ? ` (+${otherCount} open)` : ""}`);
 
 		if (!widgetRegistered) {
 			ctx.ui.setWidget(
@@ -613,7 +826,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					goalWidgetComponent = new GoalWidgetComponent({
 						tui,
 						theme,
-						getGoal: () => goalForDisplay() ?? goal,
+						getGoal: () => goalForDisplay() ?? state.goal,
+						getOpenGoalCount: () => openGoals().length,
 					});
 					return goalWidgetComponent;
 				},
@@ -624,7 +838,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			goalWidgetComponent?.update();
 		}
 
-		if (goal.status === "complete") {
+		if (state.goal.status === "complete") {
 			stopStatusRefresh();
 		} else {
 			syncStatusRefresh(ctx);
@@ -632,17 +846,37 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function loadState(ctx: ExtensionContext): void {
-		goal = null;
+		goalsById = readActiveGoalPool(ctx);
+		focusedGoalId = null;
+		let focusEntry: GoalFocusEntry | null = null;
+		let legacyGoal: GoalRecord | null = null;
+		let legacyStateSeen = false;
 		const entries = ctx.sessionManager.getBranch();
 		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i] as { type?: string; customType?: string; data?: { goal?: unknown } };
-			if (entry.type === "custom" && entry.customType === STATE_ENTRY) {
-				goal = normalizeGoalRecord(entry.data?.goal);
-				break;
+			const entry = entries[i] as { type?: string; customType?: string; data?: unknown };
+			if (entry.type !== "custom") continue;
+			if (!focusEntry && entry.customType === FOCUS_ENTRY) {
+				focusEntry = normalizeGoalFocusEntry(entry.data);
 			}
+			if (!legacyStateSeen && entry.customType === STATE_ENTRY) {
+				legacyGoal = normalizeGoalRecord(asRecord(entry.data)?.goal);
+				legacyStateSeen = true;
+			}
+			if (focusEntry && legacyStateSeen) break;
 		}
-		if (goal && goal.status !== "complete") {
-			goal = sanitizeGoalPaths(ctx, mergeGoalPromptFromDisk(ctx, goal));
+		if (legacyGoal && legacyGoal.status !== "complete") {
+			legacyGoal = sanitizeGoalPaths(ctx, mergeGoalPromptFromDisk(ctx, legacyGoal));
+		}
+		focusedGoalId = resolveSessionFocus({ pool: goalsById, focusEntry, legacyGoal });
+		if (!focusEntry && focusedGoalId) {
+			try {
+				appendFocusEntry(focusedGoalId, legacyGoal?.id === focusedGoalId ? "migrated" : "selected");
+			} catch {}
+		}
+		for (const [id, current] of goalsById) {
+			if (current.status === "complete") {
+				goalsById.delete(id);
+			}
 		}
 		clearStoppedRuntimeState();
 		accounting.budgetWarningSentFor = null;
@@ -651,19 +885,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		updateUI(ctx);
 	}
 
-	function setGoal(next: GoalRecord | null, ctx: ExtensionContext, shouldPersist = true): void {
-		const previousGoalId = goal?.id ?? null;
-		goal = next;
-		if (!goal || (goal.status !== "active" && goal.status !== "budgetLimited") || !goal.autoContinue) {
+	function setGoal(next: GoalRecord | null, ctx: ExtensionContext, shouldPersist = true, focusReason?: GoalFocusReason): void {
+		const previousGoalId = state.goal?.id ?? null;
+		state.goal = next;
+		const focusChanged = previousGoalId !== focusedGoalId;
+		if (focusChanged) {
+			clearContinuationState();
+			clearActiveAccounting();
+			resetAutoContinueCap(previousGoalId);
+			resetAutoContinueCap(focusedGoalId);
+		}
+		if (focusReason && focusChanged) appendFocusEntry(focusedGoalId, focusReason);
+		if (!state.goal || (state.goal.status !== "active" && state.goal.status !== "budgetLimited") || !state.goal.autoContinue) {
 			clearContinuationState();
 		}
-		if (!goal || goal.status === "paused" || goal.status === "complete") {
+		if (!state.goal || state.goal.status === "paused" || state.goal.status === "complete") {
 			clearActiveAccounting();
 		}
-		if (!goal || goal.id !== previousGoalId) {
+		if (!state.goal || state.goal.id !== previousGoalId) {
 			accounting.budgetWarningSentFor = null;
 			// Drop any stale tweak-edit-gate that didn't belong to this goal.
-			if (tweakDraftingFor !== null && tweakDraftingFor !== goal?.id) tweakDraftingFor = null;
+			if (tweakDraftingFor !== null && tweakDraftingFor !== state.goal?.id) tweakDraftingFor = null;
 		}
 		if (shouldPersist) persist(ctx);
 		else syncGoalTools();
@@ -671,24 +913,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function archiveCurrentGoal(ctx: ExtensionContext, reason: StopReason | undefined): GoalRecord | null {
-		if (!goal) return null;
-		let archived = mergeGoalPromptFromDisk(ctx, goal);
+		if (!state.goal) return null;
+		let archived = mergeGoalPromptFromDisk(ctx, state.goal);
 		archived = { ...archived, status: archived.status === "complete" ? "complete" : "paused", stopReason: reason };
 		return archiveGoalFile(ctx, archived);
 	}
 
 	function stopActiveGoal(status: Exclude<GoalStatus, "active">, reason: StopReason | undefined, ctx: ExtensionContext): void {
-		if (!goal) return;
-		let next = mergeGoalPromptFromDisk(ctx, goal);
+		if (!state.goal) return;
+		let next = mergeGoalPromptFromDisk(ctx, state.goal);
 		next = { ...next, status, stopReason: reason, updatedAt: nowIso() };
 		setGoal(next, ctx);
 	}
 
 	function pauseActiveGoal(ctx: ExtensionContext): void {
-		if (!goal || goal.status !== "active") return;
+		if (!state.goal || state.goal.status !== "active") return;
+		const pausedGoalId = state.goal.id;
 		// User-initiated pause (Esc / aborted turn). Clear any stale agent pause reason.
-		goal = { ...goal, autoContinue: false, pauseReason: undefined, pauseSuggestedAction: undefined };
+		state.goal = { ...state.goal, autoContinue: false, pauseReason: undefined, pauseSuggestedAction: undefined };
 		stopActiveGoal("paused", "user", ctx);
+		resetAutoContinueCap(pausedGoalId);
 		ctx.ui.notify("Goal paused.", "info");
 	}
 
@@ -696,7 +940,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) return;
 		terminalInputUnsubscribe?.();
 		terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
-			if (matchesKey(data, "escape") && goal?.status === "active" && goal.autoContinue) {
+			if (matchesKey(data, "escape") && state.goal?.status === "active" && state.goal.autoContinue) {
 				pauseActiveGoal(ctx);
 			}
 			return undefined;
@@ -706,7 +950,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	function sendQueuedContinuation(ctx: ExtensionContext, goalId: string): void {
 		continuationTimer = null;
 		continuationScheduledFor = null;
-		if (!goal || goal.id !== goalId || goal.status !== "active" || !goal.autoContinue) {
+		syncGoalTools();
+		if (!state.goal || state.goal.id !== goalId || state.goal.status !== "active" || !state.goal.autoContinue) {
 			if (continuationQueuedFor === goalId) continuationQueuedFor = null;
 			return;
 		}
@@ -726,18 +971,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		continuationQueuedFor = goalId;
-		// Increment hard-cap counter (#3) — we are about to actually send a continuation.
-		autoContinueTurns += 1;
 		pi.sendMessage<GoalEventDetails>(
 			{
 				customType: GOAL_EVENT_ENTRY,
-				content: continuationPrompt(goal),
+				content: continuationPrompt(state.goal),
 				display: false,
 				details: {
 					kind: "checkpoint",
-					goalId: goal.id,
-					status: goal.status,
-					objective: goal.objective,
+					goalId: state.goal.id,
+					status: state.goal.status,
+					objective: state.goal.objective,
 					timestamp: Date.now(),
 				},
 			},
@@ -745,24 +988,34 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 	}
 
+	function pauseForAutoContinueCap(ctx: ExtensionContext): boolean {
+		if (!state.goal || state.goal.status !== "active" || !state.goal.autoContinue) return false;
+		const goalId = state.goal.id;
+		const autoContinueTurns = autoContinueTurnsByGoalId.get(goalId) ?? 0;
+		if (!shouldAutoPauseForContinueCap({ goal: state.goal, autoContinueTurns, maxTurns: MAX_AUTOCONTINUE_TURNS })) return false;
+		if (autoContinueLimitWarnedFor !== goalId) {
+			autoContinueLimitWarnedFor = goalId;
+			try {
+				ctx.ui.notify(
+					`Auto-continue cap reached (${MAX_AUTOCONTINUE_TURNS} turns) for the active goal. Pausing. Use /goal-resume if you want to keep going.`,
+					"warning",
+				);
+			} catch {}
+			setGoal(buildAutoContinueCapPause(state.goal, { maxTurns: MAX_AUTOCONTINUE_TURNS, updatedAt: nowIso() }), ctx);
+		}
+		clearContinuationState();
+		turnStoppedFor = goalId;
+		updateUI(ctx);
+		return true;
+	}
+
 	function queueContinuation(ctx: ExtensionContext, force = false): void {
-		if (!goal || goal.status !== "active" || !goal.autoContinue) return;
-		const goalId = goal.id;
+		if (draftingFor !== null || tweakDraftingFor !== null) return;
+		if (!state.goal || state.goal.status !== "active" || !state.goal.autoContinue) return;
+		const goalId = state.goal.id;
 		// Hard cap (#3): if this active goal has already chained MAX turns,
 		// auto-pause and stop scheduling. Prevents runaway chat-only loops.
-		if (shouldAutoPauseForContinueCap({ goal, autoContinueTurns, maxTurns: MAX_AUTOCONTINUE_TURNS })) {
-			if (autoContinueLimitWarnedFor !== goalId) {
-				autoContinueLimitWarnedFor = goalId;
-				try {
-					ctx.ui.notify(
-						`Auto-continue cap reached (${MAX_AUTOCONTINUE_TURNS} turns) for the active goal. Pausing. Use /goal-resume if you want to keep going.`,
-						"warning",
-					);
-				} catch {}
-				setGoal(buildAutoContinueCapPause(goal, { maxTurns: MAX_AUTOCONTINUE_TURNS, updatedAt: nowIso() }), ctx);
-			}
-			return;
-		}
+		if (pauseForAutoContinueCap(ctx)) return;
 		if (!force && (continuationQueuedFor === goalId || continuationScheduledFor === goalId)) return;
 		clearContinuationTimer();
 		let delay = CONTINUATION_IDLE_RETRY_MS;
@@ -776,46 +1029,84 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		continuationTimer.unref?.();
 	}
 
-	function replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow = true): void {
-		if (goal && goal.status !== "complete") archiveCurrentGoal(ctx, "user");
-		setGoal(createGoal(config), ctx);
-		beginAccounting();
-		// Reset hard-cap counter — this is a fresh goal.
-		autoContinueTurns = 0;
-		autoContinueLimitWarnedFor = null;
-		// A goal was committed — clear drafting state if any.
-		draftingFor = null;
-		ctx.ui.notify(buildGoalRunningNotification(config), "info");
-		if (startNow && goal?.autoContinue) queueContinuation(ctx, true);
+	function queueDraftingNudge(ctx: ExtensionContext, draft: DraftingState): void {
+		const prior = draftingNudgesByDraftId.get(draft.draftId) ?? 0;
+		if (prior >= 3) return;
+		draftingNudgesByDraftId.set(draft.draftId, prior + 1);
+		const hasQuestion = draft.questionsAsked > 0;
+		const content = hasQuestion
+			? `[GOAL DRAFTING focus=${draft.focus} draftId=${draft.draftId}]
+The required drafting question has already been asked. The original topic is concrete enough. Your next action MUST be a propose_goal_draft tool call with draftId=${draft.draftId}. Do not ask more questions, do not use normal text, and do not use work tools.`
+			: `[GOAL DRAFTING focus=${draft.focus} draftId=${draft.draftId}]
+Drafting is still active, but your last response did not use a question tool. Plain assistant text does not satisfy the runtime gate. Your next action MUST be goal_question or goal_questionnaire. Ask one minimal calibration question with a recommended default; if the topic is already concrete, immediately call propose_goal_draft after that question.`;
+		pi.sendMessage<GoalEventDetails>(
+			{
+				customType: GOAL_EVENT_ENTRY,
+				content,
+				display: false,
+				details: {
+					kind: "drafting",
+					goalId: draft.draftId,
+					status: "active",
+					objective: draft.originalTopic,
+					timestamp: Date.now(),
+				},
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
 	}
 
-	function startGoalTweakDrafting(hint: string, ctx: ExtensionContext): void {
-		if (!goal) {
-			ctx.ui.notify("No goal is set. Use /goal-set or /goal-sisyphus to start one.", "warning");
-			return;
+	function replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow = true): void {
+		setGoal(createGoal(config), ctx, true, "created");
+		beginAccounting();
+		// Reset hard-cap counter — this is a fresh goal.
+		resetAutoContinueCap(state.goal?.id);
+		// A goal was committed — clear drafting state if any.
+		if (draftingFor) draftingNudgesByDraftId.delete(draftingFor.draftId);
+		draftingFor = null;
+		ctx.ui.notify(buildGoalRunningNotification(config), "info");
+		if (startNow && state.goal?.autoContinue) queueContinuation(ctx, true);
+	}
+
+	async function startGoalTweakDrafting(hint: string, ctx: ExtensionContext): Promise<void> {
+		reconcileFocusedGoalFromDisk(ctx);
+		clearContinuationState();
+		clearActiveAccounting();
+		if (!state.goal) {
+			if (openGoals().length > 0) {
+				const selected = await chooseOpenGoal(ctx, "Tweak which open goal?");
+				if (!selected) return;
+			} else {
+				ctx.ui.notify("No goal is set. Use /goal-set or /goal-sisyphus to start one.", "warning");
+				return;
+			}
 		}
-		if (goal.status === "complete") {
+		const currentGoal = state.goal;
+		if (!currentGoal) return;
+		if (currentGoal.status === "complete") {
 			ctx.ui.notify("Goal is complete. Use /goal-set to start a new one.", "warning");
 			return;
 		}
 		syncGoalPromptFromDisk(ctx);
 		persist(ctx);
 		const trimmed = hint.trim();
-		const sisyphusOn = goal.sisyphus;
+		const focused = state.goal;
+		if (!focused) return;
+		const sisyphusOn = focused.sisyphus;
 		const label = sisyphusOn ? "Sisyphus tweak drafting" : "Goal tweak drafting";
 		// Activate the tweak edit-gate so apply_goal_tweak is callable.
-		tweakDraftingFor = goal.id;
+		tweakDraftingFor = focused.id;
 		syncGoalTools();
 		ctx.ui.notify(
 			`${label} started${trimmed ? `: ${truncateText(trimmed, 60)}` : ""}. The agent will interview you and then call apply_goal_tweak.`,
 			"info",
 		);
-		const draftId = `tweak-${goal.id}-${Date.now().toString(36)}`;
+		const draftId = `tweak-${focused.id}-${Date.now().toString(36)}`;
 		try {
 			pi.sendMessage<GoalEventDetails>(
 				{
 					customType: GOAL_EVENT_ENTRY,
-					content: goalTweakDraftingPrompt(goal, trimmed),
+					content: goalTweakDraftingPrompt(focused, trimmed),
 					display: false,
 					details: {
 						kind: "drafting",
@@ -835,6 +1126,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function startGoalDrafting(topic: string, focus: DraftingFocus, ctx: ExtensionContext): void {
+		clearContinuationState();
+		clearActiveAccounting();
 		const trimmed = topic.trim();
 		const label = focus === "sisyphus" ? "Sisyphus drafting" : "Goal drafting";
 		const hint = focus === "sisyphus"
@@ -855,12 +1148,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			startedAt: Date.now(),
 			questionsAsked: 0,
 		};
+		draftingNudgesByDraftId.delete(draftId);
 		syncGoalTools();
 		try {
 			pi.sendMessage<GoalEventDetails>(
 				{
 					customType: GOAL_EVENT_ENTRY,
-					content: goalDraftingPrompt(trimmed, focus),
+					content: goalDraftingPrompt(trimmed, focus, draftId),
 					display: false,
 					details: {
 						kind: "drafting",
@@ -877,54 +1171,109 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	async function ensureClearForNewGoal(ctx: ExtensionContext, newTopicHint: string): Promise<boolean> {
-		if (!goal || goal.status === "complete") return true;
+	async function chooseOpenGoal(ctx: ExtensionContext, title: string): Promise<GoalRecord | null> {
+		reconcileFocusedGoalFromDisk(ctx);
+		if (state.goal && state.goal.status !== "complete") return state.goal;
+		const open = openGoals();
+		if (open.length === 0) return null;
+		if (open.length === 1) {
+			const only = open[0];
+			if (!only) return null;
+			setFocusedGoalId(only.id, ctx, "selected");
+			return state.goal;
+		}
 		if (!ctx.hasUI) {
-			ctx.ui.notify("A goal already exists. Use /goal-clear first, or /goal-replace <topic> to drop and redraft it.", "warning");
-			return false;
+			ctx.ui.notify(buildUnfocusedOpenGoalsSummary(open.length), "warning");
+			return null;
 		}
-		const preview = newTopicHint ? `\n\nNew topic: ${truncateText(newTopicHint, 200)}` : "";
-		const ok = await ctx.ui.confirm("Replace current goal?", `Current: ${goal.objective}${preview}`);
-		if (!ok) {
-			ctx.ui.notify("Goal unchanged.", "info");
-			return false;
+		const labels = open.map((item) => goalSelectorLabel(item, focusedGoalId));
+		const byLabel = new Map(labels.map((label, index) => [label, open[index]?.id]));
+		const selected = await ctx.ui.select(title, labels);
+		const selectedId = selected ? byLabel.get(selected) : undefined;
+		if (!selectedId) {
+			ctx.ui.notify("Goal focus unchanged.", "info");
+			return null;
 		}
-		archiveCurrentGoal(ctx, "user");
-		setGoal(null, ctx);
-		return true;
+		setFocusedGoalId(selectedId, ctx, "selected");
+		return state.goal;
+	}
+
+	async function focusGoalCommand(ctx: ExtensionContext): Promise<void> {
+		const open = openGoals();
+		if (open.length === 0) {
+			ctx.ui.notify("No open goals. Use /goal-set or /goal-sisyphus to start one.", "warning");
+			return;
+		}
+		if (open.length === 1) {
+			const only = open[0];
+			if (!only) return;
+			setFocusedGoalId(only.id, ctx, "selected");
+			armFocusedContinuation(ctx);
+			ctx.ui.notify(`Focused goal: ${oneLineSummary(only)}`, "info");
+			return;
+		}
+		if (!ctx.hasUI) {
+			ctx.ui.notify(buildGoalListText(goalsById, focusedGoalId), "info");
+			return;
+		}
+		const labels = open.map((item) => goalSelectorLabel(item, focusedGoalId));
+		const byLabel = new Map(labels.map((label, index) => [label, open[index]?.id]));
+		const selected = await ctx.ui.select("Focus open goal", labels);
+		const selectedId = selected ? byLabel.get(selected) : undefined;
+		if (!selectedId) {
+			ctx.ui.notify("Goal focus unchanged.", "info");
+			return;
+		}
+		setFocusedGoalId(selectedId, ctx, "selected");
+		armFocusedContinuation(ctx);
+		ctx.ui.notify(`Focused goal: ${oneLineSummary(state.goal)}`, "info");
 	}
 
 	async function handleGoalCommandTopic(rawTopic: string, ctx: ExtensionContext, focus: DraftingFocus, opts: { replace: boolean }): Promise<void> {
 		const topic = rawTopic.trim();
 		pendingBudget = parseTokenBudgetFromTopic(topic);
-		if (!opts.replace && !(await ensureClearForNewGoal(ctx, topic))) return;
-		if (opts.replace && goal && goal.status !== "complete") {
+		if (opts.replace) {
+			const replacementTarget = await chooseOpenGoal(ctx, "Replace which open goal?");
+			if (openGoals().length > 0 && !replacementTarget) return;
 			archiveCurrentGoal(ctx, "user");
-			setGoal(null, ctx);
+			setGoal(null, ctx, true, "cleared");
 		}
 		startGoalDrafting(topic, focus, ctx);
 	}
 
 	async function showGoalStatus(ctx: ExtensionContext): Promise<void> {
-		syncGoalPromptFromDisk(ctx);
-		ctx.ui.notify(detailedSummary(goalForDisplay() ?? goal), "info");
+		reconcileFocusedGoalFromDisk(ctx);
+		if (state.goal) syncGoalPromptFromDisk(ctx);
+		const view = goalForDisplay() ?? state.goal;
+		const otherCount = otherOpenGoalCount(goalsById, focusedGoalId);
+		const extra = view && otherCount > 0 ? `\nOther open goals: ${otherCount} (run /goal-list or /goal-focus)` : "";
+		const text = view ? `${detailedSummary(view)}${extra}` : openGoals().length > 0 ? buildUnfocusedOpenGoalsSummary(openGoals().length) : detailedSummary(null);
+		ctx.ui.notify(text, "info");
 		updateUI(ctx);
 	}
 
 	async function handleGoalPause(ctx: ExtensionContext): Promise<void> {
-		if (!goal) {
-			ctx.ui.notify("No goal is set.", "warning");
-			return;
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal) {
+			if (openGoals().length > 0) {
+				const selected = await chooseOpenGoal(ctx, "Pause which open goal?");
+				if (!selected) return;
+			} else {
+				ctx.ui.notify("No goal is set.", "warning");
+				return;
+			}
 		}
-		if (goal.status === "complete") {
+		const currentGoal = state.goal;
+		if (!currentGoal) return;
+		if (currentGoal.status === "complete") {
 			ctx.ui.notify("Goal is complete.", "warning");
 			return;
 		}
-		if (goal.status === "paused") {
+		if (currentGoal.status === "paused") {
 			ctx.ui.notify("Goal is already paused. Use /goal-resume to continue.", "info");
 			return;
 		}
-		if (goal.status === "budgetLimited") {
+		if (currentGoal.status === "budgetLimited") {
 			ctx.ui.notify("Goal is budget-limited (not running).", "info");
 			return;
 		}
@@ -932,16 +1281,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	async function handleGoalResume(ctx: ExtensionContext): Promise<void> {
-		const resumeGate = validateResumeGoal(goal);
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal && openGoals().length > 0) {
+			const selected = await chooseOpenGoal(ctx, "Resume or focus open goal");
+			if (!selected) return;
+			if (selected.status === "active") {
+				armFocusedContinuation(ctx);
+				ctx.ui.notify(`Goal focused: ${oneLineSummary(selected)}`, "info");
+				return;
+			}
+		}
+		const resumeGate = validateResumeGoal(state.goal);
 		if (!resumeGate.ok) {
 			const level = resumeGate.message.includes("already running") ? "info" : "warning";
 			ctx.ui.notify(resumeGate.message, level);
 			return;
 		}
-		if (!goal) throw new Error("Goal disappeared during resume validation.");
+		if (!state.goal) throw new Error("Goal disappeared during resume validation.");
 		setGoal(
 			{
-				...mergeGoalPromptFromDisk(ctx, goal),
+				...mergeGoalPromptFromDisk(ctx, state.goal),
 				status: "active",
 				autoContinue: true,
 				stopReason: undefined,
@@ -951,14 +1310,54 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx,
 		);
 		beginAccounting();
+		resetAutoContinueCap(state.goal.id);
 		ctx.ui.notify("Goal resumed.", "info");
 		queueContinuation(ctx, true);
 	}
 
+	async function handleGoalBudget(rawArgs: string, ctx: ExtensionContext): Promise<void> {
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal && openGoals().length > 0) {
+			const selected = await chooseOpenGoal(ctx, "Update budget for which open goal?");
+			if (!selected) return;
+		}
+		if (!state.goal) {
+			ctx.ui.notify("No goal is set.", "warning");
+			return;
+		}
+		const parsed = parseGoalBudgetUpdate(rawArgs);
+		if (!parsed.ok) {
+			ctx.ui.notify(parsed.message, "warning");
+			return;
+		}
+		const next = applyGoalBudgetUpdate(state.goal, { tokenBudget: parsed.tokenBudget, updatedAt: nowIso() });
+		setGoal(next, ctx);
+		resetAutoContinueCap(next.id);
+		if (next.status === "active" && next.autoContinue) {
+			beginAccounting();
+			queueContinuation(ctx, true);
+		}
+		ctx.ui.notify(`Goal budget updated: ${parsed.label}.`, "info");
+	}
+
 	async function handleGoalClear(ctx: ExtensionContext): Promise<void> {
+		if (draftingFor !== null || tweakDraftingFor !== null) {
+			draftingFor = null;
+			tweakDraftingFor = null;
+			syncGoalTools();
+			updateUI(ctx);
+			ctx.ui.notify(clearGoalCommandMessage({ archived: false, wasDrafting: true }), "info");
+			return;
+		}
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal && openGoals().length > 0) {
+			const selected = await chooseOpenGoal(ctx, "Clear which open goal?");
+			if (!selected) return;
+		}
 		const archived = archiveCurrentGoal(ctx, "user");
 		const didArchive = !!archived;
-		setGoal(null, ctx);
+		resetAutoContinueCap(state.goal?.id);
+		setGoal(null, ctx, true, "cleared");
 		// Phase 5 D: also abort any in-flight drafting so the agent's next turn
 		// doesn't try to propose into a cleared slot.
 		const wasDrafting = draftingFor !== null;
@@ -969,9 +1368,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	async function handleGoalAbort(ctx: ExtensionContext): Promise<void> {
+		if (draftingFor !== null || tweakDraftingFor !== null) {
+			draftingFor = null;
+			tweakDraftingFor = null;
+			syncGoalTools();
+			updateUI(ctx);
+			ctx.ui.notify(abortGoalCommandMessage({ archived: false, wasDrafting: true }), "info");
+			return;
+		}
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal && openGoals().length > 0) {
+			const selected = await chooseOpenGoal(ctx, "Abort which open goal?");
+			if (!selected) return;
+		}
 		const archived = archiveCurrentGoal(ctx, "user");
 		const didArchive = !!archived;
-		setGoal(null, ctx);
+		resetAutoContinueCap(state.goal?.id);
+		setGoal(null, ctx, true, "aborted");
 		const wasDrafting = draftingFor !== null;
 		draftingFor = null;
 		syncGoalTools();
@@ -989,10 +1402,24 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 	};
 	pi.registerCommand("goal", {
-		description: "Show goal status. Manage goals with /goal-set, /goal-sisyphus, /goal-tweak, /goal-replace, /goal-clear, /goal-abort, /goal-pause, /goal-resume.",
+		description: "Show focused goal status. Manage goals with /goal-set, /goal-sisyphus, /goal-list, /goal-focus, /goal-tweak, /goal-replace, /goal-clear, /goal-abort, /goal-pause, /goal-resume.",
 		handler: statusCommand.handler,
 	});
 	pi.registerCommand("goal-status", statusCommand);
+	pi.registerCommand("goal-list", {
+		description: "List all open pi goals and show which one this session is focused on.",
+		handler: async (_rawArgs, ctx) => {
+			reconcileFocusedGoalFromDisk(ctx);
+			ctx.ui.notify(buildGoalListText(goalsById, focusedGoalId), "info");
+			updateUI(ctx);
+		},
+	});
+	pi.registerCommand("goal-focus", {
+		description: "Choose which open goal this session should focus on.",
+		handler: async (_rawArgs, ctx) => {
+			await focusGoalCommand(ctx);
+		},
+	});
 
 	// /goal-set <topic>: drafting -> new normal goal (objective / criteria / boundaries).
 	pi.registerCommand("goal-set", {
@@ -1014,7 +1441,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("goal-tweak", {
 		description: "Refine the current goal via a drafting interview. The agent asks what to change, then edits the active goal file with the revised objective.",
 		handler: async (rawArgs, ctx) => {
-			startGoalTweakDrafting(rawArgs, ctx);
+			await startGoalTweakDrafting(rawArgs, ctx);
 		},
 	});
 
@@ -1058,6 +1485,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("goal-budget", {
+		description: "Set or remove the focused goal's token budget. Use /goal-budget <tokens|none>.",
+		handler: async (rawArgs, ctx) => {
+			await handleGoalBudget(rawArgs, ctx);
+		},
+	});
+
 	registerQuestionnaireTools(pi);
 
 	pi.registerTool(defineTool({
@@ -1072,10 +1506,21 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			syncGoalPromptFromDisk(ctx);
-			const view = goalForDisplay() ?? goal;
+			reconcileFocusedGoalFromDisk(ctx);
+			if (state.goal) syncGoalPromptFromDisk(ctx);
+			syncGoalTools();
+			const view = goalForDisplay() ?? state.goal;
+			const otherCount = otherOpenGoalCount(goalsById, focusedGoalId);
+			const lifecycleHint = view && (view.status === "active" || view.status === "budgetLimited" || view.status === "paused")
+				? "\nLifecycle tools: if evidence proves the objective is satisfied, call update_goal({status: \"complete\"}); if blocked, call pause_goal({reason, suggestedAction?}); if abandoned/obsolete/unsafe, call abort_goal({reason}). For file or shell work, use the normal work tools directly (write/read/bash/edit); do not call get_goal repeatedly just to look for tools."
+				: "";
+			const text = view
+				? `${detailedSummary(view)}${lifecycleHint}${otherCount > 0 ? `\nOther open goals: ${otherCount} (human can run /goal-list or /goal-focus)` : ""}`
+				: openGoals().length > 0
+					? buildUnfocusedOpenGoalsSummary(openGoals().length)
+					: detailedSummary(null);
 			return {
-				content: [{ type: "text", text: detailedSummary(view) }],
+				content: [{ type: "text", text }],
 				details: goalDetails(view),
 			};
 		},
@@ -1090,11 +1535,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.registerTool(defineTool({
 		name: "create_goal",
 		label: "Create Goal",
-		description: "Create a new active pi goal. In drafting flows (/goal-set or /goal-sisyphus), call this only after the drafting interview has produced a concrete objective. Fails if an unfinished goal already exists.",
+		description: "Create a new active pi goal and focus it. Hidden outside drafting flows; propose_goal_draft is the normal commit path.",
 		promptSnippet: "Create a persistent pi goal when the user explicitly asks for one or when a goal-drafting interview has converged.",
 		promptGuidelines: [
 			"Use create_goal only when the user explicitly asks to start a long-running goal, OR when a /goal-set or /goal-sisyphus drafting interview has produced a concrete objective.",
-			"Do not create replacement goals silently when an unfinished goal already exists.",
+			"Creating a new goal focuses it and leaves other open goals untouched. Do not archive or replace existing goals unless the user invoked /goal-replace.",
 			"Pass sisyphus=true only when the goal came out of /goal-sisyphus drafting or when the user explicitly invoked Sisyphus mode.",
 		],
 		parameters: Type.Object({
@@ -1104,12 +1549,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (goal && goal.status !== "complete") {
-				return {
-					content: [{ type: "text", text: "An unfinished goal already exists. Ask the user before replacing it." }],
-					details: goalDetails(goal),
-				};
-			}
+			return {
+				content: [{ type: "text", text: "create_goal REJECTED: direct goal creation is disabled. Use /goal-set or /goal-sisyphus and propose_goal_draft so the user can confirm the goal." }],
+				details: goalDetails(state.goal),
+			};
+			/* legacy implementation kept unreachable for old transcript shape reference
 			const budget = pendingBudget;
 			pendingBudget = null; // consumed
 			const config: GoalCreationConfig = {
@@ -1121,9 +1565,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!config.objective) throw new Error("Goal objective must not be empty.");
 			replaceGoal(config, ctx, false);
 			return {
-				content: [{ type: "text", text: buildGoalCreatedReport({ objective: config.objective, detailedSummary: detailedSummary(goal) }) }],
-				details: goalDetails(goal),
+				content: [{ type: "text", text: buildGoalCreatedReport({ objective: config.objective, detailedSummary: detailedSummary(state.goal) }) }],
+				details: goalDetails(state.goal),
 			};
+			*/
 		},
 		renderCall(args, theme) {
 			const prefix = args?.sisyphus ? "create_goal sisyphus " : "create_goal ";
@@ -1159,14 +1604,16 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			objective: Type.String({ description: "Full goal text. For Sisyphus goals this MUST include the user's numbered steps + per-step done criteria, taken faithfully from the user's input." }),
 			autoContinue: Type.Optional(Type.Boolean({ description: "Whether pi should keep sending continuation prompts until complete. Default true." })),
 			sisyphus: Type.Optional(Type.Boolean({ description: "Must equal true for /goal-sisyphus drafting, false for /goal-set drafting. Schema-enforced via B1 gate." })),
+			draftId: Type.Optional(Type.String({ description: "Draft id from the [GOAL DRAFTING ... draftId=...] prompt. Required when present to reject stale overlapping drafts." })),
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const validation = validateGoalDraftProposal({
 				drafting: draftingFor,
-				hasUnfinishedGoal: !!goal && goal.status !== "complete",
+				hasUnfinishedGoal: !!state.goal && state.goal.status !== "complete",
 				objective: params.objective,
 				sisyphus: params.sisyphus,
+				draftId: params.draftId,
 			});
 			if (!validation.ok) {
 				if (validation.clearDrafting) {
@@ -1175,7 +1622,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				}
 				return {
 					content: [{ type: "text", text: validation.message }],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
 			const activeDrafting = draftingFor;
@@ -1205,8 +1652,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				try {
 					decision = await showProposalDialog(ctx, draftSummary, activeDrafting.focus);
 				} catch (err) {
-					ctx.ui.notify(`Could not show draft dialog: ${(err as Error).message}. Auto-confirming.`, "warning");
-					decision = "confirm";
+					const message = proposalDialogFailureMessage(err);
+					ctx.ui.notify(message, "error");
+					return {
+						content: [{ type: "text", text: message }],
+						details: goalDetails(state.goal),
+					};
 				}
 			}
 
@@ -1222,8 +1673,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				replaceGoal(config, ctx, false);
 				syncGoalTools();
 				return {
-					content: [{ type: "text", text: buildGoalCreatedReport({ objective, detailedSummary: detailedSummary(goal) }) }],
-					details: goalDetails(goal),
+					content: [{ type: "text", text: buildGoalCreatedReport({ objective, detailedSummary: detailedSummary(state.goal) }) }],
+					details: goalDetails(state.goal),
+					terminate: true,
 				};
 			}
 			// "continue" — user wants to keep chatting. Drafting state stays armed.
@@ -1232,7 +1684,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					type: "text",
 					text: "User clicked 'Continue Chatting'. The goal was NOT created. Ask the user what they want to change about the draft (objective, scope, criteria, steps), then revise and call propose_goal_draft again. Do not call propose_goal_draft again with the same content — wait for the user's input first.",
 				}],
-				details: goalDetails(goal),
+				details: goalDetails(state.goal),
 			};
 		},
 		renderCall(args, theme) {
@@ -1262,30 +1714,40 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			reconcileFocusedGoalFromDisk(ctx);
 			if (params.status !== COMPLETE_STATUS) throw new Error("update_goal only supports status=complete.");
-			const completionGate = validateGoalCompletion({ goal, runningGoalId });
+			const completionGate = validateGoalCompletion({ goal: state.goal, runningGoalId });
 			if (!completionGate.ok) {
 				return {
 					content: [{ type: "text", text: completionGate.message }],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
-			if (!goal) throw new Error("Goal disappeared during completion validation.");
+			if (!state.goal) throw new Error("Goal disappeared during completion validation.");
 			// Account for any remaining elapsed time before stopping.
 			accountProgress(ctx, { allowBudgetSteering: false, accountBudgetLimited: true });
-			goal = mergeGoalPromptFromDisk(ctx, goal);
+			state.goal = mergeGoalPromptFromDisk(ctx, state.goal);
 			stopActiveGoal("complete", "agent", ctx);
+			const completedGoal = state.goal;
 			// C9 fix: mark turn-stopped so subsequent in-turn tool calls are blocked.
-			turnStoppedFor = goal?.id ?? null;
+			turnStoppedFor = completedGoal?.id ?? null;
+			if (completedGoal) {
+				resetAutoContinueCap(completedGoal.id);
+				goalsById.delete(completedGoal.id);
+				focusedGoalId = null;
+				appendFocusEntry(null, "completed");
+				syncGoalTools();
+				updateUI(ctx);
+			}
 			return {
 				content: [{
 					type: "text",
 					text: buildCompletionReport({
-						detailedSummary: detailedSummary(goal),
+						detailedSummary: detailedSummary(completedGoal),
 						completionSummary: params.completionSummary,
 					}),
 				}],
-				details: goalDetails(goal),
+				details: goalDetails(completedGoal),
 				terminate: true,
 			};
 		},
@@ -1316,26 +1778,28 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			reconcileFocusedGoalFromDisk(ctx);
 			const reason = params.reason.trim();
 			if (!reason) throw new Error("pause_goal requires a non-empty reason.");
-			const pauseGate = validatePauseGoal({ goal, runningGoalId, reason });
+			const pauseGate = validatePauseGoal({ goal: state.goal, runningGoalId, reason });
 			if (!pauseGate.ok) {
 				return {
 					content: [{ type: "text", text: pauseGate.message }],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
-			if (!goal) throw new Error("Goal disappeared during pause validation.");
+			if (!state.goal) throw new Error("Goal disappeared during pause validation.");
 			const suggested = params.suggestedAction?.trim() || undefined;
 
 			// Account for any remaining elapsed time before stopping the run.
 			accountProgress(ctx, { allowBudgetSteering: false, accountBudgetLimited: true });
-			goal = mergeGoalPromptFromDisk(ctx, goal);
-			const next = buildPausedByAgentGoal(goal, { reason, suggestedAction: suggested, updatedAt: nowIso() });
+			state.goal = mergeGoalPromptFromDisk(ctx, state.goal);
+			const next = buildPausedByAgentGoal(state.goal, { reason, suggestedAction: suggested, updatedAt: nowIso() });
 			setGoal(next, ctx);
+			resetAutoContinueCap(next.id);
 			// C9 fix: mark turn-stopped so subsequent in-turn tool calls are blocked.
 			// This is the schema-level closure of "agent kept writing files after pause_goal".
-			turnStoppedFor = goal.id;
+			turnStoppedFor = state.goal.id;
 
 			const suggestionLine = suggested ? `\nSuggested: ${truncateText(suggested, 160)}` : "";
 			ctx.ui.notify(
@@ -1347,7 +1811,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					type: "text",
 					text: `Goal paused. Reason: ${reason}${suggested ? `\nSuggested: ${suggested}` : ""}\nWaiting for user to /goal-resume, /goal-tweak, or /goal-clear. Stop now; do not start another tool call.`,
 				}],
-				details: goalDetails(goal),
+				details: goalDetails(state.goal),
 				terminate: true,
 			};
 		},
@@ -1375,24 +1839,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			reconcileFocusedGoalFromDisk(ctx);
 			const reason = params.reason.trim();
 			if (!reason) throw new Error("abort_goal requires a non-empty reason.");
-			const abortGate = validateGoalAbort({ goal, runningGoalId, reason });
+			const abortGate = validateGoalAbort({ goal: state.goal, runningGoalId, reason });
 			if (!abortGate.ok) {
 				return {
 					content: [{ type: "text", text: abortGate.message }],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
-			if (!goal) throw new Error("Goal disappeared during abort validation.");
-			const abortedGoalId = goal.id;
+			if (!state.goal) throw new Error("Goal disappeared during abort validation.");
+			const abortedGoalId = state.goal.id;
 
 			// Account for any remaining elapsed time before abandoning the run.
 			accountProgress(ctx, { allowBudgetSteering: false, accountBudgetLimited: true });
-			goal = mergeGoalPromptFromDisk(ctx, goal);
-			goal = buildAbortedByAgentGoal(goal, { reason, updatedAt: nowIso() });
+			state.goal = mergeGoalPromptFromDisk(ctx, state.goal);
+			state.goal = buildAbortedByAgentGoal(state.goal, { reason, updatedAt: nowIso() });
 			const archived = archiveCurrentGoal(ctx, "agent");
-			setGoal(null, ctx);
+			resetAutoContinueCap(abortedGoalId);
+			setGoal(null, ctx, true, "aborted");
 			turnStoppedFor = abortedGoalId;
 
 			const archiveLine = archived?.archivedPath ? `\nArchive: ${archived.archivedPath}` : "";
@@ -1405,7 +1871,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					type: "text",
 					text: `Goal aborted. Reason: ${reason}${archiveLine}\nThe goal has been archived and cleared. Stop now; do not start another tool call.`,
 				}],
-				details: goalDetails(goal),
+				details: goalDetails(state.goal),
 				terminate: true,
 			};
 		},
@@ -1435,7 +1901,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			return {
 				content: [{ type: "text", text: "step_complete is no longer required. Sisyphus is now a prompt/criteria style that uses the normal goal lifecycle. Continue working from the objective, or call update_goal(status=complete) only when the full objective is satisfied." }],
-				details: goalDetails(goal),
+				details: goalDetails(state.goal),
 			};
 		},
 		renderCall(args, theme) {
@@ -1465,13 +1931,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!goal) {
+			reconcileFocusedGoalFromDisk(ctx);
+			if (!state.goal) {
 				return {
 					content: [{ type: "text", text: "No goal is set; apply_goal_tweak is a no-op." }],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
-			if (tweakDraftingFor !== goal.id) {
+			if (tweakDraftingFor !== state.goal.id) {
 				return {
 					content: [{
 						type: "text",
@@ -1479,13 +1946,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 							"This tool can only be called during a /goal-tweak drafting interview that the user initiated. " +
 							"If you want to change the goal, ask the user to run /goal-tweak.",
 					}],
-					details: goalDetails(goal),
+					details: goalDetails(state.goal),
 				};
 			}
-			if (goal.status !== "active" && goal.status !== "budgetLimited" && goal.status !== "paused") {
+			if (state.goal.status !== "active" && state.goal.status !== "budgetLimited" && state.goal.status !== "paused") {
 				return {
-					content: [{ type: "text", text: `Goal is ${statusLabel(goal)}; cannot apply a tweak.` }],
-					details: goalDetails(goal),
+					content: [{ type: "text", text: `Goal is ${statusLabel(state.goal)}; cannot apply a tweak.` }],
+					details: goalDetails(state.goal),
 				};
 			}
 			const newObjective = params.newObjective.trim();
@@ -1493,7 +1960,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const changeSummary = params.changeSummary.trim();
 			if (!changeSummary) throw new Error("apply_goal_tweak requires a non-empty changeSummary.");
 			const next: GoalRecord = {
-				...goal,
+				...state.goal,
 				objective: newObjective,
 				updatedAt: nowIso(),
 				// Clear any prior agent pause reason — the user has redefined the work.
@@ -1510,14 +1977,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			//   2) update in-memory `goal` to the canonical post-write record
 			//   3) append the state entry and re-sync tools
 			//   4) clear the tweak drafting gate so apply_goal_tweak can't be re-used
-			goal = writeActiveGoalFile(ctx, next);
-			pi.appendEntry(STATE_ENTRY, goalDetails(goal));
+			state.goal = writeActiveGoalFile(ctx, next);
+			pi.appendEntry(STATE_ENTRY, goalDetails(state.goal));
 			tweakDraftingFor = null;
 			// Reset autoContinue counter — plan changed, agent gets a fresh chain.
-			autoContinueTurns = 0;
-			autoContinueLimitWarnedFor = null;
+			resetAutoContinueCap(state.goal.id);
 			// C9 fix: mark turn-stopped so subsequent in-turn tool calls are blocked.
-			turnStoppedFor = goal.id;
+			turnStoppedFor = state.goal.id;
 			syncGoalTools();
 			updateUI(ctx);
 			ctx.ui.notify(`Goal tweaked: ${truncateText(changeSummary, 160)}`, "info");
@@ -1526,7 +1992,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					type: "text",
 					text: `Goal tweak applied. ${changeSummary}\nStop now; the next continuation will arrive automatically if the goal is active.`,
 				}],
-				details: goalDetails(goal),
+				details: goalDetails(state.goal),
 				terminate: true,
 			};
 		},
@@ -1554,23 +2020,23 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const queuedGoalId = goalEventMessageId(candidate);
 			if (!queuedGoalId) return message;
 			if (
-				goal?.id === queuedGoalId
-				&& (goal.status === "active" || goal.status === "budgetLimited")
-				&& goal.autoContinue
+				state.goal?.id === queuedGoalId
+				&& (state.goal.status === "active" || state.goal.status === "budgetLimited")
+				&& state.goal.autoContinue
 				&& latestGoalEventIndex.get(queuedGoalId) === index
 			) return message;
 			changed = true;
 			const details = asRecord(candidate.details) ?? {};
 			return {
 				...message,
-				content: staleContinuationPrompt(queuedGoalId, goal),
+				content: staleContinuationPrompt(queuedGoalId, state.goal),
 				display: false,
 				details: {
 					...details,
 					kind: "stale",
 					goalId: queuedGoalId,
-					currentGoalId: goal?.id ?? null,
-					currentStatus: goal?.status ?? null,
+					currentGoalId: state.goal?.id ?? null,
+					currentStatus: state.goal?.status ?? null,
 				},
 			} as typeof message;
 		});
@@ -1582,11 +2048,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		goalWorkToolCalledThisTurn = false;
 		turnStoppedFor = null;
 		beginAccounting();
+		if (draftingFor === null && tweakDraftingFor === null && state.goal?.status === "active" && state.goal.autoContinue) {
+			if (pauseForAutoContinueCap(ctx)) {
+				try {
+					ctx.abort?.();
+				} catch {}
+				return;
+			}
+			autoContinueTurnsByGoalId.set(state.goal.id, (autoContinueTurnsByGoalId.get(state.goal.id) ?? 0) + 1);
+		}
 		updateUI(ctx);
 	});
 
 	// #4 + C9 fix + Phase 5 C3: gate in-turn tool calls based on lifecycle state.
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		// Post-stop in-turn block (C9 0ad8 fix): after pause_goal / abort_goal /
 		// update_goal=complete / apply_goal_tweak fires in this turn, block all subsequent tool calls except
 		// read-only inspection. Forces the agent to yield the turn instead of "fixing"
@@ -1598,6 +2073,26 @@ export default function goalExtension(pi: ExtensionAPI): void {
 					`Do not call more tools; end the turn with a brief summary and yield to the user.`,
 			};
 		}
+		if (draftingFor === null && tweakDraftingFor === null && state.goal?.status === "active") {
+			if (event.toolName === PROPOSE_DRAFT_TOOL_NAME || event.toolName === QUESTION_TOOL_NAME || event.toolName === QUESTIONNAIRE_TOOL_NAME) {
+				syncGoalTools();
+				return {
+					block: true,
+					reason: `An active goal is already confirmed (goalId=${state.goal.id}). Do not keep drafting or asking drafting questions. Use write/read/bash/edit to do the concrete work, then update_goal when verified.`,
+				};
+			}
+			if (event.toolName === "get_goal") {
+				const prior = activeGetGoalTurnsByGoalId.get(state.goal.id) ?? 0;
+				activeGetGoalTurnsByGoalId.set(state.goal.id, prior + 1);
+				if (prior >= 1) {
+					syncGoalTools();
+					return {
+						block: true,
+						reason: `You already inspected the active goal (goalId=${state.goal.id}). Stop querying get_goal. Use write/read/bash/edit now to do the concrete work, then update_goal or pause_goal based on evidence.`,
+					};
+				}
+			}
+		}
 		// Phase 5 C3: drafting whitelist. During /goal-set, /goal-sisyphus, or /goal-tweak
 		// drafting, block all work tools (bash/write/edit/read/grep/find/ls/step_complete/...)
 		// except the dedicated drafting tools. Drafting is a CONVERSATION;
@@ -1608,17 +2103,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			toolName: event.toolName,
 			draftingFocus: draftingFor?.focus ?? null,
 			tweakDraftingGoalId: tweakDraftingFor,
-			activeGoalId: goal?.id ?? null,
+			activeGoalId: state.goal?.id ?? null,
 			proposeToolName: PROPOSE_DRAFT_TOOL_NAME,
 			tweakApplyToolName: TWEAK_APPLY_TOOL_NAME,
 		});
 		if (draftingGate.block) return draftingGate;
 		if (draftingFor && isQuestionLikeToolName(event.toolName)) {
-			draftingFor = { ...draftingFor, questionsAsked: draftingFor.questionsAsked + 1 };
+			const eventRecord = asRecord(event);
+			const eventArgs = asRecord(eventRecord?.args);
+			const questionText = String(eventArgs?.question ?? eventArgs?.questions ?? "");
+			const shouldCount = ctx.hasUI || isHeadlessQuestionSufficientForDraft({ topic: draftingFor.originalTopic, questionText });
+			if (shouldCount) draftingFor = { ...draftingFor, questionsAsked: draftingFor.questionsAsked + 1 };
+			syncGoalTools();
 		}
 		// Track for #4 empty-turn gate.
-		if (GOAL_WORK_TOOL_SET.has(event.toolName)) {
+		if (isMeaningfulProgressToolCall(event.toolName, asRecord(event)?.args)) {
+			if (state.goal?.id) activeGetGoalTurnsByGoalId.delete(state.goal.id);
 			goalWorkToolCalledThisTurn = true;
+		} else if (state.goal?.status === "active" && state.goal.autoContinue && event.toolName !== "get_goal") {
+			// A blocked non-progress tool (for example repeated get_goal or stale
+			// propose_goal_draft) should not create an infinite retry chain.
+			turnStoppedFor = state.goal.id;
 		}
 		return;
 	});
@@ -1629,6 +2134,17 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_end", async (event, ctx) => {
 		const message = event.message as AssistantMessageLike;
+		if (draftingFor !== null || tweakDraftingFor !== null) {
+			if (
+				draftingFor !== null
+				&& !isAbortedAssistantMessage(message)
+				&& !isToolUseAssistantMessage(message)
+				&& (draftingFor.questionsAsked > 0 || isHeadlessQuestionSufficientForDraft({ topic: draftingFor.originalTopic, questionText: "" }))
+			) {
+				queueDraftingNudge(ctx, draftingFor);
+			}
+			return;
+		}
 		const tokens = assistantTurnTokens(message);
 		accountProgress(ctx, { allowBudgetSteering: true, completedTurnTokens: tokens });
 
@@ -1642,8 +2158,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		// just chatting and we should not keep firing turns (would burn budget on noise).
 		if (
 			!isToolUseAssistantMessage(message)
-			&& goal?.status === "active"
-			&& goal.autoContinue
+			&& state.goal?.status === "active"
+			&& state.goal.autoContinue
 			&& goalWorkToolCalledThisTurn
 		) {
 			queueContinuation(ctx);
@@ -1661,11 +2177,15 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (event, ctx) => {
 		loadState(ctx);
 		syncTerminalInputPause(ctx);
+		if (event.reason === "resume" && !state.goal && openGoals().length > 1 && ctx.hasUI) {
+			await focusGoalCommand(ctx);
+		}
 		// Codex behavior: prompt before reactivating a paused goal on resume.
-		if (event.reason === "resume" && goal?.status === "paused" && ctx.hasUI) {
-			const shouldResume = await ctx.ui.confirm("Resume paused goal?", `Goal: ${goal.objective}`);
+		if (event.reason === "resume" && state.goal?.status === "paused" && ctx.hasUI) {
+			const current = state.goal;
+			const shouldResume = await ctx.ui.confirm("Resume paused goal?", `Goal: ${current.objective}`);
 			if (shouldResume) {
-				setGoal({ ...goal, status: "active", autoContinue: true, stopReason: undefined, pauseReason: undefined, pauseSuggestedAction: undefined }, ctx);
+				setGoal({ ...current, status: "active", autoContinue: true, stopReason: undefined, pauseReason: undefined, pauseSuggestedAction: undefined }, ctx);
 			}
 		}
 		beginAccounting();
@@ -1677,10 +2197,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
-		if (goal) persist(ctx);
+		if (draftingFor !== null || tweakDraftingFor !== null) return;
+		if (state.goal) persist(ctx);
 		beginAccounting();
 		// Arm a generic post-compaction reminder for the next agent turn.
-		if (shouldArmPostCompactReminder(goal)) {
+		if (shouldArmPostCompactReminder(state.goal)) {
 			postCompactReminderPending = true;
 		}
 		queueContinuation(ctx, true);
@@ -1694,20 +2215,38 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		syncGoalTools();
+		const currentSystemPrompt = () => ctx.getSystemPrompt?.() || event.systemPrompt;
 		const incomingGoalId = extractGoalIdFromInjectedMessage(event.prompt ?? "");
+		const incomingDraftId = extractDraftIdFromInjectedMessage(event.prompt ?? "");
+
+		const draftIdentity = validateDraftPromptIdentity({ incomingDraftId, activeDraftId: draftingFor?.draftId ?? null });
+		if (draftIdentity.block) {
+			try {
+				ctx.abort?.();
+			} catch {}
+			return { systemPrompt: `${currentSystemPrompt()}\n\n${draftIdentity.reason}` };
+		}
+
+		if (draftingFor !== null || tweakDraftingFor !== null) {
+			clearContinuationState();
+			clearActiveAccounting();
+			runningGoalId = null;
+			return { systemPrompt: currentSystemPrompt() };
+		}
 
 		// If this turn was triggered by a hidden goal checkpoint that no longer
 		// matches the active goal, abort the whole turn instead of letting the
 		// model act on a stale instruction.
 		if (incomingGoalId !== null) {
 			clearContinuationState();
-			if (!goal || goal.id !== incomingGoalId || (goal.status !== "active" && goal.status !== "budgetLimited") || !goal.autoContinue) {
+			if (!state.goal || state.goal.id !== incomingGoalId || (state.goal.status !== "active" && state.goal.status !== "budgetLimited") || !state.goal.autoContinue) {
 				try {
 					ctx.abort?.();
 				} catch {}
 				updateUI(ctx);
 				return {
-					systemPrompt: `${event.systemPrompt}\n\n${staleContinuationPrompt(incomingGoalId, goal)}`,
+					systemPrompt: `${currentSystemPrompt()}\n\n${staleContinuationPrompt(incomingGoalId, state.goal)}`,
 				};
 			}
 		} else {
@@ -1715,42 +2254,54 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			// double-fire after the user's own message returns. Also reset the
 			// autoContinue hard-cap counter so the user always gets a fresh chain.
 			clearContinuationState();
-			autoContinueTurns = 0;
-			autoContinueLimitWarnedFor = null;
+			resetAutoContinueCap(state.goal?.id);
 		}
 
-		if (!goal) {
+		if (!state.goal) {
 			runningGoalId = null;
+			const openCount = openGoals().length;
+			if (openCount > 0) {
+				return { systemPrompt: `${currentSystemPrompt()}\n\n${unfocusedOpenGoalsPrompt(openCount)}` };
+			}
 			return;
 		}
-		if (goal.status !== "complete") goal = mergeGoalPromptFromDisk(ctx, goal);
-		runningGoalId = goal.status === "active" || goal.status === "budgetLimited" ? goal.id : null;
-		if (goal.status === "complete") return;
-		if (goal.status === "paused") {
+		reconcileFocusedGoalFromDisk(ctx);
+		if (!state.goal) {
+			runningGoalId = null;
+			const openCount = openGoals().length;
+			if (openCount > 0) return { systemPrompt: `${currentSystemPrompt()}\n\n${unfocusedOpenGoalsPrompt(openCount)}` };
+			return;
+		}
+		runningGoalId = state.goal.status === "active" || state.goal.status === "budgetLimited" ? state.goal.id : null;
+		if (state.goal.status === "complete") return;
+		if (state.goal.status === "paused") {
+			const current = state.goal;
 			const pauseExtras: string[] = [];
-			if (goal.stopReason === "agent") {
+			if (current.stopReason === "agent") {
 				pauseExtras.push("");
-				pauseExtras.push(`Pause reason (you set this in a prior turn via pause_goal): ${goal.pauseReason ?? "(unknown)"}`);
-				if (goal.pauseSuggestedAction) pauseExtras.push(`You suggested: ${goal.pauseSuggestedAction}`);
+				pauseExtras.push(`Pause reason (you set this in a prior turn via pause_goal): ${current.pauseReason ?? "(unknown)"}`);
+				if (current.pauseSuggestedAction) pauseExtras.push(`You suggested: ${current.pauseSuggestedAction}`);
 			}
 			return {
-				systemPrompt: `${event.systemPrompt}\n\n[PI GOAL PAUSED goalId=${goal.id}]\n${untrustedObjectiveBlock(goal)}${pauseExtras.join("\n")}\n\nThe goal is paused. Do not autonomously continue substantive work unless the user resumes it with /goal-resume. If the user explicitly asks to finish or abandon the paused goal, or the objective is already satisfied based on available evidence, you may call update_goal(status=complete) or abort_goal without resuming. Do not call pause_goal again.`,
+				systemPrompt: `${currentSystemPrompt()}\n\n[PI GOAL PAUSED goalId=${current.id}]\n${untrustedObjectiveBlock(current)}${pauseExtras.join("\n")}\n\nThe goal is paused. Do not autonomously continue substantive work unless the user resumes it with /goal-resume. If the user explicitly asks to finish or abandon the paused goal, or the objective is already satisfied based on available evidence, you may call update_goal(status=complete) or abort_goal without resuming. Do not call pause_goal again.`,
 			};
 		}
-		if (goal.status === "budgetLimited") {
+		if (state.goal.status === "budgetLimited") {
+			const current = state.goal;
 			return {
-				systemPrompt: `${event.systemPrompt}\n\n[PI GOAL BUDGET LIMIT goalId=${goal.id}]\n${untrustedObjectiveBlock(goal)}\n\n${budgetBlock(goal)}\n\nThe goal is budget_limited. Do not start new substantive work for it. Summarize useful progress, identify remaining work, and leave the user a clear next step.`,
+				systemPrompt: `${currentSystemPrompt()}\n\n[PI GOAL BUDGET LIMIT goalId=${current.id}]\n${untrustedObjectiveBlock(current)}\n\n${budgetBlock(current)}\n\nThe goal is budget_limited. Do not start new substantive work for it. Summarize useful progress, identify remaining work, and leave the user a clear next step. The user can run /goal-budget <tokens|none> to raise or remove the budget and resume with a fresh auto-continue cap.`,
 			};
 		}
-		let prompt = goalPrompt(goal);
-		if (shouldInjectPostCompactReminder({ pending: postCompactReminderPending, goal })) {
+		let prompt = goalPrompt(state.goal);
+		if (shouldInjectPostCompactReminder({ pending: postCompactReminderPending, goal: state.goal })) {
 			postCompactReminderPending = false;
-			prompt = `${prompt}\n\n[POST-COMPACTION RESYNC goalId=${goal.id}]\nThe conversation was just compacted. Re-read the objective and continue from the actual artifacts/state; do not rely on memory of the prior chat.`;
+			prompt = `${prompt}\n\n[POST-COMPACTION RESYNC goalId=${state.goal.id}]\nThe conversation was just compacted. Re-read the objective and continue from the actual artifacts/state; do not rely on memory of the prior chat.`;
 		}
-		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
+		return { systemPrompt: `${currentSystemPrompt()}\n\n${prompt}` };
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		if (draftingFor !== null || tweakDraftingFor !== null) return;
 		const endedGoalId = runningGoalId;
 		runningGoalId = null;
 
@@ -1759,14 +2310,14 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		const abortedTokens = event.messages
 			.filter(isAbortedAssistantMessage)
 			.reduce((sum, message) => sum + assistantTurnTokens(message), 0);
-		if (abortedTokens > 0 && endedGoalId && goal?.id === endedGoalId) {
+		if (abortedTokens > 0 && endedGoalId && state.goal?.id === endedGoalId) {
 			accountProgress(ctx, { allowBudgetSteering: false, completedTurnTokens: abortedTokens, accountBudgetLimited: true });
 		}
 
 		continuationQueuedFor = null;
-		if (!goal || goal.status !== "active" || !goal.autoContinue) return;
-		if (endedGoalId && goal.id !== endedGoalId) return;
-		goal = mergeGoalPromptFromDisk(ctx, goal);
+		if (!state.goal || state.goal.status !== "active" || !state.goal.autoContinue) return;
+		if (endedGoalId && state.goal.id !== endedGoalId) return;
+		if (!reconcileFocusedGoalFromDisk(ctx)) return;
 		if (hasAbortedAssistantMessage(event.messages) || ctx.signal?.aborted) {
 			pauseActiveGoal(ctx);
 			return;
@@ -1782,6 +2333,6 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		stopStatusRefresh();
 		terminalInputUnsubscribe?.();
 		terminalInputUnsubscribe = null;
-		if (goal) persist(ctx);
+		if (state.goal) persist(ctx);
 	});
 }

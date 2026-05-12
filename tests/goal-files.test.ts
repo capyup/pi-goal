@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,8 @@ import {
 	archiveGoalFile,
 	archivedPathForGoal,
 	parseGoalFile,
+	readActiveGoalFiles,
+	readActiveGoalPool,
 	serializeGoalFile,
 	writeActiveGoalFile,
 } from "../extensions/storage/goal-files.ts";
@@ -71,6 +73,35 @@ test("goal file paths stay under active and archive roots even with unsafe metad
 		const archived = archiveGoalFile(ctx, active);
 		assert.equal(archived.activePath, undefined);
 		assert.match(archived.archivedPath ?? "", /^\.pi\/goals\/archived\/goal_/);
+	} finally {
+		cleanup(ctx);
+	}
+});
+
+test("readActiveGoalFiles scans deterministic safe active goal files only", () => {
+	const ctx = tempCtx();
+	try {
+		mkdirSync(path.join(ctx.cwd, ".pi/goals"), { recursive: true });
+		const first = writeActiveGoalFile(ctx, {
+			...createGoal({ objective: "First", autoContinue: true, tokenBudget: null, sisyphus: false }, Date.UTC(2026, 0, 2, 3, 4, 5)),
+			id: "b-goal",
+		});
+		const second = writeActiveGoalFile(ctx, {
+			...createGoal({ objective: "Second", autoContinue: true, tokenBudget: null, sisyphus: true }, Date.UTC(2026, 0, 1, 3, 4, 5)),
+			id: "a-goal",
+		});
+		writeFileSync(path.join(ctx.cwd, ".pi/goals", "active_goal_invalid.md"), "not json", "utf8");
+		writeFileSync(path.join(ctx.cwd, ".pi/goals", "note.md"), serializeGoalFile(first), "utf8");
+		try {
+			symlinkSync(path.join(ctx.cwd, first.activePath ?? "missing"), path.join(ctx.cwd, ".pi/goals", "active_goal_symlink.md"));
+		} catch {}
+
+		const goals = readActiveGoalFiles(ctx);
+		assert.deepEqual(goals.map((goal) => goal.id), ["a-goal", "b-goal"]);
+		assert.deepEqual(goals.map((goal) => goal.activePath), [second.activePath, first.activePath]);
+
+		const pool = readActiveGoalPool(ctx);
+		assert.deepEqual(Array.from(pool.keys()).sort(), ["a-goal", "b-goal"]);
 	} finally {
 		cleanup(ctx);
 	}

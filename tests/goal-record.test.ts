@@ -4,6 +4,8 @@ import test from "node:test";
 import {
 	cloneGoal,
 	createGoal,
+	goalFocusDetails,
+	normalizeGoalFocusEntry,
 	normalizeGoalRecord,
 	type GoalCreationConfig,
 } from "../extensions/goal-record.ts";
@@ -71,4 +73,29 @@ test("cloneGoal returns a detached usage object", () => {
 
 	assert.equal(goal.usage.tokensUsed, 0);
 	assert.equal(cloned.usage.tokensUsed, 500);
+});
+
+test("goal focus entries persist only session focus metadata", () => {
+	assert.deepEqual(goalFocusDetails("goal/123", "created"), {
+		version: 1,
+		focusedGoalId: "goal_123",
+		reason: "created",
+	});
+	assert.deepEqual(goalFocusDetails(null, "cleared"), {
+		version: 1,
+		focusedGoalId: null,
+		reason: "cleared",
+	});
+
+	assert.deepEqual(normalizeGoalFocusEntry({ version: 1, focusedGoalId: "abc/def", reason: "resumed" }), {
+		version: 1,
+		focusedGoalId: "abc_def",
+		reason: "resumed",
+	});
+	assert.deepEqual(normalizeGoalFocusEntry({ version: 1, focusedGoalId: "", reason: "unknown" }), {
+		version: 1,
+		focusedGoalId: null,
+		reason: "selected",
+	});
+	assert.equal(normalizeGoalFocusEntry({ version: 3, focusedGoalId: "abc" }), null);
 });

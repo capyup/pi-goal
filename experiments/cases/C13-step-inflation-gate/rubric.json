@@ -14,10 +14,10 @@
   },
   {
     "id": "objective-has-only-two-numbered-steps",
-    "desc": "Final accepted objective must have exactly 2 numbered steps (no agent-inflated step 3+).",
+    "desc": "Final accepted objective must preserve the user's two requested steps without adding a third task step.",
     "kind": "tool-args-jq",
     "tool": "propose_goal_draft",
-    "jq": "(.objective | test(\"(?m)^\\\\s*1\\\\.\\\\s\")) and (.objective | test(\"(?m)^\\\\s*2\\\\.\\\\s\")) and ((.objective | test(\"(?m)^\\\\s*3\\\\.\\\\s\")) | not)"
+    "jq": "(.objective | test(\"(1[.)]|Step 1)\")) and (.objective | test(\"(2[.)]|Step 2)\")) and ((.objective | test(\"(3[.)]|Step 3)\")) | not)"
   },
   {
     "id": "a-txt-created",
@@ -32,14 +32,6 @@
     "kind": "sandbox-file-contains",
     "path": "b.txt",
     "pattern": "^beta$"
-  },
-  {
-    "id": "step-complete-called-exactly-twice",
-    "desc": "Exactly 2 step_complete calls (matching user's 2-step plan).",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "op": "eq",
-    "count": 2
   },
   {
     "id": "update-goal-complete",

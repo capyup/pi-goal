@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
 	abortGoalCommandMessage,
+	applyGoalBudgetUpdate,
 	buildAbortedByAgentGoal,
 	buildAutoContinueCapPause,
 	buildCompletionReport,
@@ -10,6 +11,7 @@ import {
 	buildPausedByAgentGoal,
 	clearGoalCommandMessage,
 	isGoalUnfinished,
+	parseGoalBudgetUpdate,
 	shouldArmPostCompactReminder,
 	shouldAutoPauseForContinueCap,
 	shouldInjectPostCompactReminder,
@@ -56,7 +58,7 @@ test("goal lifecycle creation and completion gates reject unsafe transitions", (
 	assert.equal(isGoalUnfinished(goal({ status: "complete" })), false);
 
 	assert.deepEqual(validateGoalCreationSlot(null), { ok: true });
-	assert.match(rejectedMessage(validateGoalCreationSlot(goal({ status: "paused" }))), /unfinished goal/);
+	assert.deepEqual(validateGoalCreationSlot(goal({ status: "paused" })), { ok: true });
 
 	assert.deepEqual(validateGoalCompletion({ goal: goal({ sisyphus: false }) }), { ok: true });
 	const noGoal = validateGoalCompletion({ goal: null });
@@ -160,4 +162,29 @@ test("budget, autoContinue cap, and compaction policies are deterministic", () =
 	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: sisyphus() }), true);
 	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: goal({ sisyphus: false }) }), true);
 	assert.equal(shouldInjectPostCompactReminder({ pending: false, goal: sisyphus() }), false);
+});
+
+test("budget updates parse safely and reactivate budget-limited goals", () => {
+	assert.deepEqual(parseGoalBudgetUpdate("none"), { ok: true, tokenBudget: null, label: "none" });
+	assert.deepEqual(parseGoalBudgetUpdate("25k"), { ok: true, tokenBudget: 25_000, label: "25,000" });
+	assert.equal(parseGoalBudgetUpdate("abc").ok, false);
+
+	const updated = applyGoalBudgetUpdate(goal({
+		status: "budgetLimited",
+		autoContinue: false,
+		tokenBudget: 100,
+		usage: { tokensUsed: 100, activeSeconds: 0 },
+	}), { tokenBudget: 200, updatedAt: "2026-05-12T04:00:00.000Z" });
+	assert.equal(updated.status, "active");
+	assert.equal(updated.autoContinue, true);
+	assert.equal(updated.tokenBudget, 200);
+	assert.equal(updated.updatedAt, "2026-05-12T04:00:00.000Z");
+
+	const stillLimited = applyGoalBudgetUpdate(goal({
+		status: "budgetLimited",
+		autoContinue: false,
+		tokenBudget: 100,
+		usage: { tokensUsed: 250, activeSeconds: 0 },
+	}), { tokenBudget: 200, updatedAt: "2026-05-12T04:00:00.000Z" });
+	assert.equal(stillLimited.status, "budgetLimited");
 });

@@ -6,6 +6,7 @@ export interface DraftingStateLike {
 	focus: GoalDraftingFocus;
 	originalTopic: string;
 	questionsAsked: number;
+	draftId?: string;
 }
 
 export interface DraftProposalInput {
@@ -13,6 +14,7 @@ export interface DraftProposalInput {
 	hasUnfinishedGoal: boolean;
 	objective: string;
 	sisyphus?: boolean;
+	draftId?: string;
 }
 
 export type DraftProposalValidation =
@@ -86,18 +88,20 @@ export function evaluateDraftingToolGate(args: {
 	return { block: false };
 }
 
+export function validateDraftPromptIdentity(args: { incomingDraftId: string | null; activeDraftId: string | null }): ToolGateDecision {
+	if (args.incomingDraftId === null) return { block: false };
+	if (args.activeDraftId === args.incomingDraftId) return { block: false };
+	return {
+		block: true,
+		reason: `Stale goal drafting prompt ignored (draftId=${args.incomingDraftId}). The active drafting flow is ${args.activeDraftId ?? "none"}; do not propose or create a goal from this stale prompt.`,
+	};
+}
+
 export function validateGoalDraftProposal(input: DraftProposalInput): DraftProposalValidation {
 	if (input.drafting === null) {
 		return {
 			ok: false,
 			message: "propose_goal_draft REJECTED: no /goal-set or /goal-sisyphus drafting is in progress. Tell the user to invoke /goal-set <topic> or /goal-sisyphus <topic> first.",
-		};
-	}
-	if (input.hasUnfinishedGoal) {
-		return {
-			ok: false,
-			clearDrafting: true,
-			message: "propose_goal_draft REJECTED: an unfinished goal already exists. Ask the user to /goal-clear or /goal-replace first.",
 		};
 	}
 	if (input.drafting.questionsAsked < 1) {
@@ -108,6 +112,12 @@ export function validateGoalDraftProposal(input: DraftProposalInput): DraftPropo
 	}
 
 	const expectedSisyphus = input.drafting.focus === "sisyphus";
+	if (input.draftId !== undefined && input.drafting.draftId !== undefined && input.draftId !== input.drafting.draftId) {
+		return {
+			ok: false,
+			message: `propose_goal_draft REJECTED (stale draft): active draftId is ${input.drafting.draftId}, but you passed ${input.draftId}. Ask the user to restart drafting if this was intentional.`,
+		};
+	}
 	const actualSisyphus = input.sisyphus === true;
 	if (actualSisyphus !== expectedSisyphus) {
 		return {
@@ -124,15 +134,18 @@ export function validateGoalDraftProposal(input: DraftProposalInput): DraftPropo
 	return { ok: true, objective, expectedSisyphus };
 }
 
-export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): string {
+export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus, draftId?: string): string {
 	const safeTopic = promptSafeObjective(topic.trim() || "(no topic provided — ask the user what they want to accomplish)");
+	const draftAttr = draftId ? ` draftId=${draftId}` : "";
 	const header = focus === "sisyphus"
-		? "[GOAL DRAFTING focus=sisyphus]\nThe user invoked Sisyphus mode (/goal-sisyphus). You are entering a drafting interview. Do NOT start the work yet."
-		: "[GOAL DRAFTING focus=goal]\nThe user invoked /goal-set with a topic. You are entering a drafting interview. Do NOT start the work yet.";
+		? `[GOAL DRAFTING focus=sisyphus${draftAttr}]\nThe user invoked Sisyphus mode (/goal-sisyphus). You are entering a drafting interview. Do NOT start the work yet.`
+		: `[GOAL DRAFTING focus=goal${draftAttr}]\nThe user invoked /goal-set with a topic. You are entering a drafting interview. Do NOT start the work yet.`;
 
 	const commonProtocol = [
 		"Drafting protocol — grill-me style, one branch at a time:",
 		"- You MUST ask the user at least one concrete question before calling propose_goal_draft. This is required even if the topic already looks complete. The runtime rejects proposals until a question-like tool has been used.",
+		"- The required question MUST be asked with goal_question or goal_questionnaire. Do not merely write a question in normal assistant text; plain text does not satisfy the runtime gate and leaves drafting stuck.",
+		"- If the topic is already concrete, ask one minimal calibration question with a recommended default, then immediately call propose_goal_draft. Do not end the turn with optional preference questions about implementation details such as timeout/retry policy when the user's blocker rule is already clear.",
 		"- Ask exactly one decision-oriented question at a time. Target assumptions, measurable success criteria, constraints, boundaries, priorities, risks, trade-offs, unresolved dependencies, or blocker handling.",
 		"- Provide a recommended answer with the question: a concrete proposal the user can accept, reject, or modify. Avoid rhetorical or broad open-ended questions.",
 		"- Prefer goal_question for the required first grill because it supports a focused question plus recommended options. Use goal_questionnaire only when one UI interaction genuinely needs multiple tightly related choices.",
@@ -158,7 +171,7 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 	const sisyphusFocusItems = [
 		"Drafting focus for /goal-sisyphus — establish everything /goal would (objective, criteria, boundaries, constraints, blocker handling) PLUS:",
 		"  A. The ordered execution style the user wants: patient, sequential, no rushing, no unrequested reconnaissance.",
-		"  B. Any user-provided ordered plan, preserved without adding extra mechanism steps.",
+		"  B. Any user-provided ordered plan, preserved as numbered task steps with the same step count; do not collapse, expand, or add extra mechanism steps.",
 		"  C. The completion standard: what evidence proves the whole objective is actually done.",
 		"  D. Failure rule: when blocked or unclear, default to stop-and-ask the user; do not improvise workarounds.",
 		"  E. Note: Sisyphus mode is a prompt/criteria style. It shares the same lifecycle and tools as a regular goal.",
@@ -168,14 +181,16 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 		? [
 			"When the items above are clear, summarize the plan back to the user in one short message and call propose_goal_draft with:",
 			"  - sisyphus: true (REQUIRED — schema rejects sisyphus=false during /goal-sisyphus drafting)",
-			"  - autoContinue: true (unless the user explicitly asked to drive manually)",
-			"  - objective: the FULL plan formatted like this (verbatim, including the section headers):",
+		"  - autoContinue: true (unless the user explicitly asked to drive manually)",
+		...(draftId ? [`  - draftId: ${draftId} (REQUIRED — schema rejects stale overlapping drafts)`] : []),
+		"  - objective: the FULL plan formatted like this (verbatim, including the section headers):",
 			"",
 			"    === Sisyphus Goal ===",
 			"    Objective: <one-sentence outcome>",
 			"    Success criteria: <observable evidence the goal is done>",
 			"    Boundaries: <in scope / out of scope>",
 			"    Constraints: <hard rules, files not to touch, etc.>",
+			"    Ordered steps: <if the user provided or implied ordered work, list exactly those task steps as 1. 2. ...; preserve the user's step count and do not add verification/preflight/recon steps>",
 			"    If blocked / unclear / failing: <rule, default = stop and ask the user>",
 			"    Sisyphus reminder: Work patiently and sequentially. No rushing, no unrequested preflight steps, no improvising around blockers.",
 			"",
@@ -192,8 +207,9 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 			"    Constraints: <hard rules>",
 			"    If blocked: <default = stop and ask the user>",
 			"",
-			"  - autoContinue: true (unless the user explicitly asked to drive manually)",
-			"  - sisyphus: false (REQUIRED — schema rejects sisyphus=true during /goal-set drafting; use /goal-sisyphus for Sisyphus)",
+		"  - autoContinue: true (unless the user explicitly asked to drive manually)",
+		...(draftId ? [`  - draftId: ${draftId} (REQUIRED — schema rejects stale overlapping drafts)`] : []),
+		"  - sisyphus: false (REQUIRED — schema rejects sisyphus=true during /goal-set drafting; use /goal-sisyphus for Sisyphus)",
 			"",
 			"After the user confirms in the dialog, the goal becomes active and a continuation will arrive. Begin work then. Not before. If the user picks 'Continue Chatting' instead, ask them what to revise.",
 		];

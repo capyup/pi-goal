@@ -25,6 +25,7 @@ export interface GoalWidgetOptions {
 	theme: Theme;
 	tui: TUI;
 	getGoal: () => GoalWidgetRecord | null;
+	getOpenGoalCount?: () => number;
 }
 
 function fit(value: string, width: number): string {
@@ -55,21 +56,31 @@ function displayIcon(goal: GoalWidgetRecord): { icon: string; color: GoalWidgetC
 	return goal.autoContinue ? { icon: "●", color: "accent", label: "goal running" } : { icon: "○", color: "muted", label: "goal idle" };
 }
 
-function headingMeta(goal: GoalWidgetRecord): string {
+function headingMeta(goal: GoalWidgetRecord, otherOpenGoalCount = 0): string {
 	const bits: string[] = [];
 	if (goal.status === "active" && goal.autoContinue) bits.push("auto");
 	if (goal.usage.activeSeconds > 0) bits.push(formatDuration(goal.usage.activeSeconds));
 	if (goal.usage.tokensUsed > 0) bits.push(formatTokenValue(goal.usage.tokensUsed));
+	if (otherOpenGoalCount > 0) bits.push(`+${otherOpenGoalCount} open`);
 	return bits.join(" · ");
 }
 
-export function renderGoalWidgetLines(goal: GoalWidgetRecord | null, theme: Theme, width: number): string[] {
-	if (!goal) return [];
+export function renderGoalWidgetLines(goal: GoalWidgetRecord | null, theme: Theme, width: number, options: { openGoalCount?: number } = {}): string[] {
+	if (!goal) {
+		const openGoalCount = options.openGoalCount ?? 0;
+		if (openGoalCount <= 0) return [];
+		const safeWidth = Math.max(1, width);
+		return [
+			heading(theme, safeWidth, `${theme.fg("warning", "◇")} ${theme.fg("warning", theme.bold("Goal"))} ${theme.fg("muted", "unfocused")}`, theme.fg("muted", `${openGoalCount} open`)),
+			branchLine(theme, safeWidth, true, `${theme.fg("muted", "Run /goal-focus to choose this session's goal")}`),
+		];
+	}
 	const safeWidth = Math.max(1, width);
 	const { icon, color, label } = displayIcon(goal);
 	const mode = goal.sisyphus ? "Sisyphus" : "Goal";
 	const headingLeft = `${theme.fg(color, icon)} ${theme.fg(color, theme.bold(mode))} ${theme.fg("muted", label.replace(/^sisyphus |^goal /, ""))}`;
-	const headingRight = theme.fg("muted", headingMeta(goal));
+	const otherOpenGoalCount = Math.max(0, (options.openGoalCount ?? (goal ? 1 : 0)) - 1);
+	const headingRight = theme.fg("muted", headingMeta(goal, otherOpenGoalCount));
 	const lines: string[] = [heading(theme, safeWidth, headingLeft, headingRight)];
 	const body: string[] = [];
 
@@ -104,11 +115,13 @@ export class GoalWidgetComponent implements Component {
 	private theme: Theme;
 	private tui: TUI;
 	private getGoal: () => GoalWidgetRecord | null;
+	private getOpenGoalCount: () => number;
 
 	constructor(options: GoalWidgetOptions) {
 		this.theme = options.theme;
 		this.tui = options.tui;
 		this.getGoal = options.getGoal;
+		this.getOpenGoalCount = options.getOpenGoalCount ?? (() => (this.getGoal() ? 1 : 0));
 	}
 
 	update(): void {
@@ -116,7 +129,7 @@ export class GoalWidgetComponent implements Component {
 	}
 
 	render(width: number): string[] {
-		return renderGoalWidgetLines(this.getGoal(), this.theme, width);
+		return renderGoalWidgetLines(this.getGoal(), this.theme, width, { openGoalCount: this.getOpenGoalCount() });
 	}
 
 	invalidate(): void {

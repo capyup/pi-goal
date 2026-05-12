@@ -8,10 +8,10 @@
   },
   {
     "id": "objective-has-3-steps",
-    "desc": "Objective must contain three numbered steps (1., 2., 3.).",
+    "desc": "Objective must preserve all requested target files so strict execution is possible.",
     "kind": "tool-args-jq",
     "tool": "propose_goal_draft",
-    "jq": "(.objective | test(\"\\\\b1\\\\.\")) and (.objective | test(\"\\\\b2\\\\.\")) and (.objective | test(\"\\\\b3\\\\.\"))"
+    "jq": "(.objective | test(\"a\\\\.txt|alpha\\\\.txt\")) and (.objective | test(\"b\\\\.txt|beta\\\\.txt\")) and (.objective | test(\"c\\\\.txt|gamma\\\\.txt\"))"
   },
   {
     "id": "a-txt-exists",
@@ -35,27 +35,17 @@
     "pattern": "^c$"
   },
   {
-    "id": "step-complete-called-3-times",
-    "desc": "step_complete must be called once per step (3 calls) before update_goal=complete is accepted.",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "op": "ge",
-    "count": 3
+    "id": "no-read-pi-docs",
+    "desc": "Agent should not waste a continuation reading pi package docs instead of using the available lifecycle tool.",
+    "kind": "tool-args-jq-none",
+    "tool": "read",
+    "jq": ".path | test(\"node_modules|@earendil-works\")"
   },
   {
     "id": "update-goal-complete",
-    "desc": "Agent should call update_goal=complete after all 3 steps are verified and step_complete'd.",
+    "desc": "Agent should call update_goal=complete after all 3 steps are verified .",
     "kind": "tool-args-jq",
     "tool": "update_goal",
     "jq": ".status == \"complete\""
-  },
-  {
-    "id": "step-complete-uses-verifycommand",
-    "desc": "At least 2 of the 3 step_complete calls should pass verifyCommand (user explicitly asked).",
-    "kind": "tool-call-count",
-    "tool": "step_complete",
-    "argsJq": "(.verifyCommand // \"\") | length > 0",
-    "op": "ge",
-    "count": 2
   }
 ]

@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
 	formatQuestionnaireAnswers,
+	isHeadlessQuestionSufficientForDraft,
 	normalizeQuestionnaireQuestions,
+	proposalDialogFailureMessage,
 	proposalDecisionFromQuestionnaireResult,
 	shouldAutoConfirmProposal,
 	type GoalQuestionnaireResult,
@@ -43,6 +45,17 @@ test("formatQuestionnaireAnswers emits stable Q/A records with context and optio
 	);
 });
 
+test("headless question sufficiency blocks vague-topic default fabrication", () => {
+	assert.equal(isHeadlessQuestionSufficientForDraft({
+		topic: "整理笔记",
+		questionText: "你的笔记目前存放在哪里，是什么格式？输出为什么形式？",
+	}), false);
+	assert.equal(isHeadlessQuestionSufficientForDraft({
+		topic: "在 sandbox 当前目录创建 hello.txt，内容为 Hello, Goal!，不要修改其他文件。",
+		questionText: "如果 hello.txt 已存在，应该覆盖还是停止？",
+	}), true);
+});
+
 test("proposal confirmation helpers keep headless and cancel semantics stable", () => {
 	assert.equal(shouldAutoConfirmProposal({ hasUI: false }), true);
 	assert.equal(shouldAutoConfirmProposal({ hasUI: true, autoConfirmEnv: "1" }), true);
@@ -50,4 +63,6 @@ test("proposal confirmation helpers keep headless and cancel semantics stable", 
 	assert.equal(proposalDecisionFromQuestionnaireResult({ cancelled: true, answer: "Confirm — create this goal now" }), "continue");
 	assert.equal(proposalDecisionFromQuestionnaireResult({ cancelled: false, answer: "Confirm — create this goal now" }), "confirm");
 	assert.equal(proposalDecisionFromQuestionnaireResult({ cancelled: false, answer: "Continue chatting — keep refining" }), "continue");
+	assert.match(proposalDialogFailureMessage(new Error("boom")), /NOT created/);
+	assert.match(proposalDialogFailureMessage(new Error("boom")), /drafting remains active/);
 });

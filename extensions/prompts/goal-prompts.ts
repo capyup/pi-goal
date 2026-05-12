@@ -50,6 +50,8 @@ ${untrustedObjectiveBlock(goal)}
 
 ${budgetBlock(goal)}
 
+Available work tools for pursuing the active goal include write, read, bash, and edit. Use those tools directly for file and shell work; do not call get_goal repeatedly to discover tools.
+
 Keep this goal in force until it is actually achieved. Do not pause for confirmation just because a phase, chapter, file, or checklist item is finished. At each natural stopping point, compare every explicit requirement with concrete evidence from the workspace/session. If the objective is complete, call update_goal with status=complete. If it is not complete, choose the next concrete action and do it.
 
 If you hit a real blocker that you cannot resolve with one more reasonable next step (missing credentials, contradictory spec, file/permission you cannot access, dangerous operation pending user approval, or an unclear Sisyphus-style ordered plan), the CORRECT action is to call pause_goal({reason, suggestedAction?}) with a structured, non-empty reason. pause_goal IS the channel for handing control back to the user — do not substitute a conversational "blocked, please help" summary in your final message and skip the tool call. Without pause_goal, the goal stays "active" and the UI cannot show the blocker. After pause_goal returns, you may add one short user-facing summary, but the tool call comes first.
@@ -71,6 +73,8 @@ export function continuationPrompt(goal: GoalRecord): string {
 		untrustedObjectiveBlock(goal),
 		"",
 		budgetBlock(goal),
+		"",
+		"Available work tools for pursuing the active goal include write, read, bash, and edit. Use those tools directly for file and shell work; do not call get_goal repeatedly to discover tools.",
 		"",
 		"Avoid repeating work that is already done. Choose the next concrete action toward the objective.",
 		"",
@@ -105,6 +109,7 @@ export function budgetLimitPrompt(goal: GoalRecord): string {
 		budgetBlock(goal),
 		"",
 		"The system has marked the goal as budget_limited, so do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step.",
+		"The user can run /goal-budget <tokens|none> to raise or remove the budget; if the new budget permits more work, the goal is reactivated with a fresh auto-continue cap.",
 		"",
 		"Do not call update_goal unless the goal is actually complete. If the user explicitly asks to abandon/cancel, or the objective is obsolete, impossible, or unsafe to continue, call abort_goal({reason}) instead of leaving it budget-limited.",
 	].join("\n");
@@ -182,4 +187,13 @@ This queued goal checkpoint no longer matches the active goal.
 ${currentLine}
 
 Do not perform task work for this stale checkpoint. Do not call tools. Reply briefly that the queued checkpoint is no longer active. If a different active pi goal is in force, continue that goal in your next response.`;
+}
+
+export function unfocusedOpenGoalsPrompt(openGoalCount: number): string {
+	return [
+		"[PI GOAL UNFOCUSED]",
+		`${openGoalCount} open pi goal${openGoalCount === 1 ? "" : "s"} exist, but this session has no focused goal.`,
+		"Do not choose or switch focus autonomously. Focus is human-owned intent.",
+		"Ask the user to run /goal-focus, /goal-list, or /goal-resume before doing goal work.",
+	].join("\n");
 }

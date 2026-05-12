@@ -15,6 +15,10 @@ export type PolicyValidation =
 	| { ok: true }
 	| { ok: false; message: string };
 
+export type GoalBudgetUpdate =
+	| { ok: true; tokenBudget: number | null; label: string }
+	| { ok: false; message: string };
+
 export function isGoalUnfinished(goal: Pick<GoalPolicyRecordLike, "status"> | null | undefined): boolean {
 	return !!goal && goal.status !== "complete";
 }
@@ -35,7 +39,7 @@ export function statusAfterBudgetLimit(goal: Pick<GoalPolicyRecordLike, "status"
 }
 
 export function validateGoalCreationSlot(goal: Pick<GoalPolicyRecordLike, "status"> | null): PolicyValidation {
-	if (isGoalUnfinished(goal)) return { ok: false, message: "An unfinished goal already exists. Ask the user before replacing it." };
+	void goal;
 	return { ok: true };
 }
 
@@ -116,6 +120,34 @@ export function validateResumeGoal(goal: GoalPolicyRecordLike | null): PolicyVal
 		return { ok: false, message: "Goal is budget-limited. Raise or remove the budget before resuming." };
 	}
 	return { ok: true };
+}
+
+export function parseGoalBudgetUpdate(rawArgs: string): GoalBudgetUpdate {
+	const trimmed = rawArgs.trim().toLowerCase();
+	if (!trimmed) return { ok: false, message: "Usage: /goal-budget <tokens|none>." };
+	if (["none", "remove", "off", "unlimited", "clear"].includes(trimmed)) {
+		return { ok: true, tokenBudget: null, label: "none" };
+	}
+	const normalized = trimmed.replace(/[,_\s]/g, "");
+	const match = normalized.match(/^(\d+)(k|m)?(?:tokens?)?$/);
+	if (!match) return { ok: false, message: "Budget must be a positive token count, or 'none'." };
+	const base = Number(match[1]);
+	const multiplier = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
+	const tokenBudget = Math.floor(base * multiplier);
+	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) return { ok: false, message: "Budget must be a positive token count, or 'none'." };
+	return { ok: true, tokenBudget, label: tokenBudget.toLocaleString("en-US") };
+}
+
+export function applyGoalBudgetUpdate<T extends GoalPolicyRecordLike>(goal: T, args: { tokenBudget: number | null; updatedAt: string }): T {
+	const shouldReactivate = goal.status === "budgetLimited" && (args.tokenBudget === null || goal.usage.tokensUsed < args.tokenBudget);
+	return {
+		...goal,
+		tokenBudget: args.tokenBudget,
+		status: shouldReactivate ? "active" : goal.status,
+		autoContinue: shouldReactivate ? true : goal.autoContinue,
+		stopReason: shouldReactivate ? undefined : goal.stopReason,
+		updatedAt: args.updatedAt,
+	};
 }
 
 export function clearGoalCommandMessage(args: { archived: boolean; wasDrafting: boolean }): string {
