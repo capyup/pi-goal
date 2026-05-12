@@ -1,6 +1,6 @@
 # Implemented Borrowed Patterns
 
-This document records the external patterns that are actually implemented in `pi-goal` today.
+This document records external patterns that are actually implemented in `pi-goal` today.
 
 ## From pi-codex-goal
 
@@ -16,10 +16,8 @@ This document records the external patterns that are actually implemented in `pi
 `pi-goal` uses several autonomous-loop safety patterns inspired by `pi-autoresearch`:
 
 - **Auto-continue cap**: `PI_GOAL_MAX_AUTOCONTINUE_TURNS` prevents runaway continuation chains.
-- **Empty-turn gate**: Sisyphus auto-continue does not advance when the agent did no meaningful work.
-- **Structured metrics**: `step_complete` emits machine-readable `METRIC name=value` lines for harness grading.
-- **Verification command gate**: optional `verifyCommand` must exit 0 before a Sisyphus step is marked complete.
-- **Post-compaction resync**: Sisyphus goals receive a one-shot reminder after compaction so the agent resumes with correct step state.
+- **Empty-turn gate**: auto-continue does not advance when the agent did no meaningful goal-work tool activity.
+- **Post-compaction reminder**: after compaction, the next agent turn is reminded to re-read the objective and continue from actual artifacts/state.
 
 ## pi-goal-specific work
 
@@ -27,15 +25,15 @@ The current extension also adds behavior specific to goal drafting and lifecycle
 
 - **Draft-before-run**: `/goal-set` and `/goal-sis` start a drafting interview instead of immediate execution.
 - **Confirm-before-commit**: `propose_goal_draft` is the normal creation path; `create_goal` stays hidden.
-- **Full creation output**: after confirmation, the finalized objective is printed directly into the conversation.
+- **Sisyphus as style**: `/goal-sis` uses the same lifecycle and tools as `/goal-set`; it only changes drafting/continuation wording and completion expectations.
+- **Full draft confirmation and creation output**: draft confirmation uses a plain-text report, and after confirmation the finalized objective is printed directly into the conversation.
 - **Full completion output**: completion prints a report directly into the conversation, including optional evidence and full goal details.
 - **Built-in question tools**: `goal_question` and `goal_questionnaire` provide package-local user-dialogue tools with `goal_` prefixes.
 - **Centralized tool names**: published tool names and allowlists live in `goal-tool-names.ts`.
 - **Questionnaire componentization**: normalization, answer formatting, proposal confirmation, and question-tool registration live in `goal-questionnaire.ts`.
+- **Goal Beacon widget**: the above-editor status display is a dedicated TUI component.
 
 ## Current validation
-
-The local unit suite covers the extracted helper modules. The end-to-end experiment harness covers runtime behavior with real pi sessions and model calls.
 
 Run locally:
 

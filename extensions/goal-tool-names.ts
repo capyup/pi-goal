@@ -7,8 +7,7 @@ export const QUESTIONNAIRE_TOOL_NAME = "goal_questionnaire";
 
 export const ACTIVE_GOAL_TOOL_NAMES = ["get_goal", "update_goal", "pause_goal"] as const;
 
-export const SISYPHUS_WORK_TOOL_NAMES = [
-	SISYPHUS_STEP_TOOL_NAME,
+export const GOAL_WORK_TOOL_NAMES = [
 	"update_goal",
 	"pause_goal",
 	TWEAK_APPLY_TOOL_NAME,

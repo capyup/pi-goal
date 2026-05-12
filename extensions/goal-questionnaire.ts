@@ -357,14 +357,14 @@ export async function runGoalQuestionnaire(ctx: ExtensionContext, rawQuestions: 
  */
 export async function showProposalDialog(
 	ctx: ExtensionContext,
-	markdownBody: string,
+	confirmationText: string,
 	focus: GoalDraftingFocus,
 ): Promise<ProposalDecision> {
 	const headerTitle = focus === "sisyphus" ? "Confirm Sisyphus Goal Draft" : "Confirm Goal Draft";
 	const result = await runGoalQuestionnaire(ctx, [{
 		id: "confirm",
 		question: headerTitle,
-		context: markdownBody,
+		context: confirmationText,
 		options: ["Confirm — create this goal now", "Continue chatting — keep refining"],
 		recommended: 0,
 		allowCustom: false,

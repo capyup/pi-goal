@@ -17,8 +17,6 @@ function goal(overrides: Partial<GoalWidgetRecord> = {}): GoalWidgetRecord {
 		tokenBudget: 10_000,
 		usage: { activeSeconds: 65, tokensUsed: 2500 },
 		sisyphus: true,
-		totalSteps: 2,
-		stepsCompleted: 1,
 		activePath: ".pi/goals/active_goal.md",
 		...overrides,
 	};
@@ -26,12 +24,13 @@ function goal(overrides: Partial<GoalWidgetRecord> = {}): GoalWidgetRecord {
 
 test("renderGoalWidgetLines renders a distinct Sisyphus goal beacon", () => {
 	const lines = renderGoalWidgetLines(goal(), theme, 100);
-	assert.match(lines[0], /╭─ ◆ Sisyphus running/);
-	assert.match(lines[0], /\[▰▰▰▰▰▱▱▱▱▱\] 1\/2 · auto · 1m05s · 2\.5K/);
-	assert.match(lines[1], /⟡ Componentize the goal widget/);
+	assert.match(lines[0], /^◆ Sisyphus running/);
+	assert.match(lines[0], /auto · 1m05s · 2\.5K/);
+	assert.doesNotMatch(lines[0], /▰|▱/);
+	assert.match(lines[1], /^├─ ⟡ Componentize the goal widget/);
 	assert.doesNotMatch(lines.join("\n"), /pulse/);
-	assert.match(lines[2], /budget 10K .* remaining 7\.5K/);
-	assert.match(lines.at(-1) ?? "", /╰─ \.pi\/goals\/active_goal\.md/);
+	assert.match(lines[2], /^├─ budget 10K .* remaining 7\.5K/);
+	assert.match(lines.at(-1) ?? "", /^└─ \.pi\/goals\/active_goal\.md/);
 });
 
 test("renderGoalWidgetLines merges complete usage into the heading", () => {
@@ -39,11 +38,9 @@ test("renderGoalWidgetLines merges complete usage into the heading", () => {
 		status: "complete",
 		autoContinue: false,
 		sisyphus: false,
-		totalSteps: null,
-		stepsCompleted: 0,
 		archivedPath: ".pi/goals/archived/goal.md",
 	}), theme, 100);
-	assert.match(lines[0], /╭─ ✓ Goal complete/);
+	assert.match(lines[0], /^✓ Goal complete/);
 	assert.match(lines[0], /1m05s · 2\.5K/);
 	assert.doesNotMatch(lines.join("\n"), /pulse/);
 });
@@ -58,6 +55,6 @@ test("renderGoalWidgetLines highlights agent blockers and suggested action", () 
 		pauseSuggestedAction: "Set TOKEN and run /goal-resume",
 	}), theme, 100);
 	assert.match(lines[0], /⊘ Sisyphus blocked/);
-	assert.match(lines.join("\n"), /blocker Missing API token/);
-	assert.match(lines.join("\n"), /next Set TOKEN and run \/goal-resume/);
+	assert.match(lines.join("\n"), /^├─ blocker Missing API token/m);
+	assert.match(lines.join("\n"), /^├─ next Set TOKEN and run \/goal-resume/m);
 });

@@ -6,7 +6,6 @@ import {
 	buildCompletionReport,
 	buildGoalCreatedReport,
 	buildPausedByAgentGoal,
-	classifyVerifyCommandResult,
 	clearGoalCommandMessage,
 	isGoalUnfinished,
 	shouldArmPostCompactReminder,
@@ -18,7 +17,6 @@ import {
 	validateGoalCreationSlot,
 	validatePauseGoal,
 	validateResumeGoal,
-	validateStepCompletion,
 	type GoalPolicyRecordLike,
 } from "../extensions/goal-policy.ts";
 
@@ -40,9 +38,6 @@ function sisyphus(overrides: Partial<GoalPolicyRecordLike> = {}): GoalPolicyReco
 	return goal({
 		objective: "=== Sisyphus Goal ===\nSteps:\n1. A\n2. B",
 		sisyphus: true,
-		totalSteps: 2,
-		stepsCompleted: 0,
-		currentStep: 1,
 		...overrides,
 	});
 }
@@ -73,11 +68,7 @@ test("goal lifecycle creation and completion gates reject unsafe transitions", (
 	assert.equal(paused.ok, false);
 	if (!paused.ok) assert.match(paused.message, /ask the user to resume/);
 
-	const incompleteSis = validateGoalCompletion({ goal: sisyphus({ stepsCompleted: 1 }) });
-	assert.equal(incompleteSis.ok, false);
-	if (!incompleteSis.ok) assert.match(incompleteSis.message, /Only 1 step\(s\).*1 step\(s\) remain/);
-
-	assert.deepEqual(validateGoalCompletion({ goal: sisyphus({ stepsCompleted: 2 }) }), { ok: true });
+	assert.deepEqual(validateGoalCompletion({ goal: sisyphus() }), { ok: true });
 });
 
 test("pause, resume, and clear policy preserve human-owned lifecycle affordances", () => {
@@ -121,50 +112,6 @@ test("pause, resume, and clear policy preserve human-owned lifecycle affordances
 	);
 });
 
-test("Sisyphus step gate rejects wrong mode, wrong status, duplicates, skips, and finished goals", () => {
-	assert.match(rejectedMessage(validateStepCompletion({ goal: null, stepIndex: 1, evidence: "done" })), /no-op/);
-	assert.match(rejectedMessage(validateStepCompletion({ goal: goal(), stepIndex: 1, evidence: "done" })), /only applies to Sisyphus/);
-	assert.match(rejectedMessage(validateStepCompletion({ goal: sisyphus({ status: "paused", autoContinue: false }), stepIndex: 1, evidence: "done" })), /does not apply/);
-	assert.match(rejectedMessage(validateStepCompletion({ goal: sisyphus({ totalSteps: null }), stepIndex: 1, evidence: "done" })), /no parseable numbered step count/);
-	assert.match(rejectedMessage(validateStepCompletion({ goal: sisyphus(), stepIndex: 1, evidence: "   " })), /requires a non-empty evidence/);
-
-	const duplicate = validateStepCompletion({ goal: sisyphus({ stepsCompleted: 1, currentStep: 2 }), stepIndex: 1, evidence: "done" });
-	assert.equal(duplicate.ok, false);
-	if (!duplicate.ok) assert.match(duplicate.message, /already marked complete/);
-
-	const skip = validateStepCompletion({ goal: sisyphus({ stepsCompleted: 0 }), stepIndex: 2, evidence: "done" });
-	assert.equal(skip.ok, false);
-	if (!skip.ok) assert.match(skip.message, /cannot skip to step 2/);
-
-	const finished = validateStepCompletion({ goal: sisyphus({ stepsCompleted: 2, currentStep: 2 }), stepIndex: 3, evidence: "done" });
-	assert.equal(finished.ok, false);
-	if (!finished.ok) assert.match(finished.message, /All 2 steps are already marked complete/);
-
-	assert.deepEqual(
-		validateStepCompletion({ goal: sisyphus({ stepsCompleted: 1, currentStep: 2 }), stepIndex: 2, evidence: "  verified  " }),
-		{ ok: true, evidence: "verified", done: 1, expected: 2, stepIndex: 2 },
-	);
-});
-
-test("verifyCommand policy rejects failed proof and only accepts exit 0", () => {
-	const execError = classifyVerifyCommandResult({ stepIndex: 1, result: null, execError: "ENOENT" });
-	assert.equal(execError.ok, false);
-	if (!execError.ok) assert.match(execError.message, /could not be executed.*ENOENT/);
-
-	const killed = classifyVerifyCommandResult({ stepIndex: 1, result: { code: 1, killed: true, stdout: "partial", stderr: "" } });
-	assert.equal(killed.ok, false);
-	if (!killed.ok) assert.match(killed.message, /TIMED OUT.*Partial output/s);
-
-	const nonZero = classifyVerifyCommandResult({ stepIndex: 1, result: { code: 2, killed: false, stdout: "missing", stderr: "bad" } });
-	assert.equal(nonZero.ok, false);
-	if (!nonZero.ok) assert.match(nonZero.message, /exited with code 2.*Verify output/s);
-
-	assert.deepEqual(
-		classifyVerifyCommandResult({ stepIndex: 1, result: { code: 0, killed: false, stdout: "ok", stderr: "" } }),
-		{ ok: true, summary: " verifyCommand passed (exit 0)." },
-	);
-});
-
 test("budget, autoContinue cap, and compaction policies are deterministic", () => {
 	assert.equal(statusAfterBudgetLimit(goal({ tokenBudget: 10, usage: { tokensUsed: 9, activeSeconds: 0 } })), "active");
 	assert.equal(statusAfterBudgetLimit(goal({ tokenBudget: 10, usage: { tokensUsed: 10, activeSeconds: 0 } })), "budgetLimited");
@@ -183,10 +130,9 @@ test("budget, autoContinue cap, and compaction policies are deterministic", () =
 	assert.match(capped.pauseSuggestedAction ?? "", /goal-resume/);
 
 	assert.equal(shouldArmPostCompactReminder(sisyphus({ status: "active" })), true);
-	assert.equal(shouldArmPostCompactReminder(sisyphus({ status: "budgetLimited" })), true);
-	assert.equal(shouldArmPostCompactReminder(goal({ sisyphus: false })), false);
+	assert.equal(shouldArmPostCompactReminder(goal({ status: "budgetLimited", sisyphus: false })), true);
 	assert.equal(shouldArmPostCompactReminder(sisyphus({ status: "paused", autoContinue: false })), false);
 	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: sisyphus() }), true);
-	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: goal({ sisyphus: false }) }), false);
+	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: goal({ sisyphus: false }) }), true);
 	assert.equal(shouldInjectPostCompactReminder({ pending: false, goal: sisyphus() }), false);
 });

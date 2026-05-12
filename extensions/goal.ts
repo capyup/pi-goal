@@ -4,19 +4,17 @@ import { matchesKey, Text, visibleWidth } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	countUserSteps,
 	footerStatus,
 	formatDuration,
 	formatRemainingTokens,
 	formatTokenBudget,
 	formatTokenValue,
-	parseSisyphusStepCount,
 	parseTokenBudgetFromTopic,
 	statusLabel,
 	truncateText,
 } from "./goal-core.ts";
 import {
-	buildDraftSummaryMarkdown,
+	buildDraftConfirmationText,
 	evaluateDraftingToolGate,
 	goalDraftingPrompt,
 	promptSafeObjective,
@@ -36,7 +34,7 @@ import {
 	QUESTIONNAIRE_TOOL_NAME,
 	QUESTION_TOOL_NAME,
 	SISYPHUS_STEP_TOOL_NAME,
-	SISYPHUS_WORK_TOOL_NAMES,
+	GOAL_WORK_TOOL_NAMES,
 	TWEAK_APPLY_TOOL_NAME,
 } from "./goal-tool-names.ts";
 import { GoalWidgetComponent } from "./goal-widget.ts";
@@ -46,7 +44,6 @@ import {
 	buildCompletionReport,
 	buildGoalCreatedReport,
 	buildPausedByAgentGoal,
-	classifyVerifyCommandResult,
 	clearGoalCommandMessage,
 	shouldArmPostCompactReminder,
 	shouldAutoPauseForContinueCap,
@@ -55,7 +52,6 @@ import {
 	validateGoalCompletion,
 	validatePauseGoal,
 	validateResumeGoal,
-	validateStepCompletion,
 } from "./goal-policy.ts";
 
 const STATE_ENTRY = "pi-goal-state";
@@ -83,10 +79,8 @@ const MAX_AUTOCONTINUE_TURNS = (() => {
  * Tools that count as "real work" toward the active goal. If a non-tool-use
  * turn ends without any of these having been called, we DO NOT queue the next
  * autoContinue — the agent was just chatting. This stops infinite chat loops.
- * step_complete / update_goal / pause_goal / apply_goal_tweak / create_goal
- * count, as do the workhorse tools the agent uses to execute steps.
  */
-const SISYPHUS_WORK_TOOL_SET = new Set<string>(SISYPHUS_WORK_TOOL_NAMES);
+const GOAL_WORK_TOOL_SET = new Set<string>(GOAL_WORK_TOOL_NAMES);
 
 
 /**
@@ -106,11 +100,11 @@ const POST_STOP_ALLOWED_TOOL_SET = new Set<string>(POST_STOP_ALLOWED_TOOLS);
 let tweakDraftingFor: string | null = null;
 
 /**
- * Phase 5 D + B1 + B2: when non-null, a /goal-set or /goal-sis drafting flow
+ * Phase 5 D + B1: when non-null, a /goal-set or /goal-sis drafting flow
  * is in progress. During that window:
  *   - propose_goal_draft tool is the ONLY way to commit the goal (UI confirm)
  *   - create_goal tool is hidden from the agent
- *   - schema gates B1 (focus consistency) and B2 (step preservation) fire
+ *   - schema gate B1 (focus consistency) fires
  *     when the agent calls propose_goal_draft
  *
  * Cleared after goal is created (confirmed) or the user replaces/clears it.
@@ -118,7 +112,6 @@ let tweakDraftingFor: string | null = null;
 interface DraftingState {
 	focus: GoalDraftingFocus;
 	originalTopic: string;       // user's exact input to /goal-set or /goal-sis
-	userStepCount: number;       // numbered steps the user wrote (0 if none)
 	draftId: string;
 	startedAt: number;
 }
@@ -132,13 +125,6 @@ let draftingFor: DraftingState | null = null;
  */
 let pendingBudget: number | null = null;
 
-
-/**
- * Parse the numbered step count out of a sisyphus objective. Counts the highest
- * contiguous `N.` prefix seen at the start of any line within the Steps block.
- * If no numbered steps are found, returns null (the goal is sisyphus by flag
- * but has no parseable step list — schema gates default to off in that case).
- */
 
 type GoalStatus = "active" | "paused" | "budgetLimited" | "complete";
 type StopReason = "user" | "agent";
@@ -166,13 +152,6 @@ interface GoalRecord {
 	// Set by the agent's pause_goal tool. Cleared when the goal becomes active again.
 	pauseReason?: string;
 	pauseSuggestedAction?: string;
-	// Sisyphus step tracking. totalSteps is parsed from the numbered step list in
-	// the objective at creation/tweak time. stepsCompleted is incremented only by
-	// the step_complete tool. currentStep is always stepsCompleted + 1 (until done).
-	// Non-sisyphus goals leave these null/undefined.
-	totalSteps?: number | null;
-	stepsCompleted?: number;
-	currentStep?: number;
 }
 
 interface GoalStateEntry {
@@ -244,7 +223,6 @@ function cloneGoal(goal: GoalRecord): GoalRecord {
 
 function createGoal(config: GoalCreationConfig, now = Date.now()): GoalRecord {
 	const timestamp = nowIso(now);
-	const totalSteps = config.sisyphus ? parseSisyphusStepCount(config.objective) : null;
 	return {
 		id: newGoalId(),
 		objective: config.objective,
@@ -255,9 +233,6 @@ function createGoal(config: GoalCreationConfig, now = Date.now()): GoalRecord {
 		sisyphus: config.sisyphus,
 		createdAt: timestamp,
 		updatedAt: timestamp,
-		totalSteps: totalSteps ?? null,
-		stepsCompleted: 0,
-		currentStep: 1,
 	};
 }
 
@@ -303,29 +278,6 @@ function normalizeGoalRecord(value: unknown): GoalRecord | null {
 		status = "budgetLimited";
 	}
 
-	// Sisyphus step tracking. Migrate from older records lacking these fields
-	// by parsing totalSteps from the objective and defaulting stepsCompleted/currentStep.
-	let totalSteps: number | null = null;
-	let stepsCompleted = 0;
-	let currentStep = 1;
-	if (sisyphus) {
-		const rawTotal = raw.totalSteps;
-		const parsed = parseSisyphusStepCount(objective);
-		if (rawTotal === null) totalSteps = null;
-		else if (typeof rawTotal === "number" && Number.isFinite(rawTotal) && rawTotal > 0) totalSteps = Math.floor(rawTotal);
-		else totalSteps = parsed ?? null;
-		const rawCompleted = raw.stepsCompleted;
-		if (typeof rawCompleted === "number" && Number.isFinite(rawCompleted) && rawCompleted >= 0) {
-			stepsCompleted = Math.min(Math.floor(rawCompleted), totalSteps ?? Math.floor(rawCompleted));
-		}
-		const rawCurrent = raw.currentStep;
-		if (typeof rawCurrent === "number" && Number.isFinite(rawCurrent) && rawCurrent >= 1) {
-			currentStep = Math.floor(rawCurrent);
-		} else {
-			currentStep = stepsCompleted + 1;
-		}
-	}
-
 	return {
 		id: typeof raw.id === "string" && raw.id ? safeIdPart(raw.id) : newGoalId(),
 		objective,
@@ -341,9 +293,6 @@ function normalizeGoalRecord(value: unknown): GoalRecord | null {
 		stopReason: raw.stopReason === "agent" || raw.stopReason === "user" ? raw.stopReason : undefined,
 		pauseReason: typeof raw.pauseReason === "string" && raw.pauseReason.trim() ? raw.pauseReason : undefined,
 		pauseSuggestedAction: typeof raw.pauseSuggestedAction === "string" && raw.pauseSuggestedAction.trim() ? raw.pauseSuggestedAction : undefined,
-		totalSteps: sisyphus ? totalSteps : undefined,
-		stepsCompleted: sisyphus ? stepsCompleted : undefined,
-		currentStep: sisyphus ? currentStep : undefined,
 	};
 }
 
@@ -369,12 +318,7 @@ function detailedSummary(goal: GoalRecord | null): string {
 		...usageLines(goal),
 	];
 	if (goal.sisyphus) {
-		lines.push("Mode: Sisyphus (strict step-by-step, no skipping, no rushing)");
-		if (typeof goal.totalSteps === "number" && goal.totalSteps > 0) {
-			const done = goal.stepsCompleted ?? 0;
-			const cur = goal.currentStep ?? done + 1;
-			lines.push(`Sisyphus progress: ${done}/${goal.totalSteps} steps completed (next: step ${cur})`);
-		}
+		lines.push("Mode: Sisyphus (prompt/criteria variant; shared goal lifecycle)");
 	}
 	if (goal.activePath) lines.push(`File: ${goal.activePath}`);
 	if (goal.archivedPath) lines.push(`Archive: ${goal.archivedPath}`);
@@ -417,35 +361,17 @@ function budgetBlock(goal: GoalRecord): string {
 
 function sisyphusDisciplineBlock(goal: GoalRecord): string {
 	if (!goal.sisyphus) return "";
-	const total = typeof goal.totalSteps === "number" && goal.totalSteps > 0 ? goal.totalSteps : null;
-	const done = goal.stepsCompleted ?? 0;
-	const cur = goal.currentStep ?? done + 1;
-	const progressLine = total !== null
-		? `Sisyphus progress (schema-tracked): ${done}/${total} steps completed. Next step you must execute: step ${cur}.`
-		: "Sisyphus progress (schema-tracked): step count could not be parsed from the objective; execute the numbered steps strictly in order.";
-	const stepCompleteRule = total !== null
-		? `- After you finish each step AND have verified it against its done criterion, you MUST call step_complete({stepIndex: ${cur}, evidence: "<one-sentence proof>", verifyCommand?: "<bash command, exit 0 = step done>"}) before moving to the next step. The system tracks stepsCompleted via this tool. update_goal(complete) is REJECTED by the schema until step_complete has been called for all ${total} steps.`
-		: "- After you finish each step AND have verified it against its done criterion, you MUST call step_complete({stepIndex: <current step number>, evidence: \"<one-sentence proof>\", verifyCommand?: \"<bash command, exit 0 = step done>\"}) before moving to the next step. update_goal(complete) is REJECTED by the schema until step_complete has been called for every numbered step.";
-	const verifyRule = "- STRONGLY PREFER passing verifyCommand on step_complete whenever the step has a filesystem or shell-level done criterion. The framework runs it as `bash -c <verifyCommand>` in the working directory; exit 0 means PASS (step recorded) and non-zero means FAIL (step REJECTED, you must actually finish the work first). Examples: `test -f a.txt && [ \"$(cat a.txt)\" = a ]`, `diff -q expected.txt actual.txt`. Keep verifyCommand short, deterministic, and read-only. This is the system's protection against accidentally claiming a step was done when it wasn't — using it makes your evidence trustworthy.";
 	return [
 		"",
-		`[SISYPHUS DISCIPLINE goalId=${goal.id}]`,
-		"This is a Sisyphus goal. The user has chosen this mode because the value of the work is in faithful, patient, step-by-step execution. Honor that choice.",
+		`[SISYPHUS STYLE goalId=${goal.id}]`,
+		"This is a Sisyphus goal. It uses the same lifecycle and tools as a regular goal; the difference is the execution style and completion standard.",
 		"",
-		progressLine,
-		"",
-		"Strict execution rules:",
-		"- Follow the numbered steps in the objective exactly, in the order they are written. Do not skip steps. Do not combine adjacent steps. Do not re-order. Do not silently substitute a 'better' step.",
-		"- There is no reward for finishing early. Do not rush. Do not get anxious about how long the road is. Each step is the work itself, like Sisyphus pushing the stone.",
-		"- Before each action, state out loud which numbered step you are on and quote that step verbatim. Then do exactly that step and nothing more. Then verify it against the step's done criterion. Then move to the next step.",
-		stepCompleteRule,
-		verifyRule,
-		"- DO NOT look ahead. Do not preflight future steps. Do not read/list/check files referenced only by later steps before you have executed and verified all earlier steps. If step 5's precondition is missing, you discover that AT step 5 — not at step 1. Look-ahead reconnaissance violates strict order and wastes step 1's discipline.",
-		"- DO NOT pre-check. When a step requires reading or modifying a file, DO NOT run `ls`, `test -f`, `find`, or any other reconnaissance command to verify the file exists before you act. Just attempt the step directly. If the file is missing, the tool itself will fail (e.g. ENOENT) — THAT is your signal to call pause_goal. Reconnaissance loops (`test -f` → not found → test again → not found...) are waste and delay; they do not unblock the step.",
-		"- If a step is unclear, blocked, fails, or seems wrong: stop. Do not invent a workaround. Do not 'just try something'. Call pause_goal({reason, suggestedAction?}) so the user can /goal-tweak the step or unblock you. The interview-then-pause-then-tweak loop is part of the discipline.",
-		"- Do not collapse multiple steps into one tool call or one assistant turn unless the objective explicitly groups them. One step per push.",
-		"- Do not call update_goal with status=complete until every numbered step has been executed AND individually verified AND step_complete has been called for each. The schema enforces this; you cannot bypass it.",
-		"- Do not use pause_goal as an escape hatch from merely tedious work \u2014 only for real blockers. Do not use update_goal=complete to escape blockers \u2014 pause_goal is the right channel.",
+		"Style / criteria guidance:",
+		"- Follow the user's ordered plan faithfully. Do not add reconnaissance, preflight, or verification steps that the user did not ask for.",
+		"- Work patiently and sequentially. Do not rush to a shortcut just because it looks more efficient.",
+		"- Verify each meaningful action against the objective's own success criteria before moving on.",
+		"- If a step is unclear, blocked, fails, or seems wrong: call pause_goal({reason, suggestedAction?}) instead of inventing a workaround.",
+		"- Call update_goal(status=complete) only after the full objective is actually satisfied. There is no separate step counter or step_complete requirement.",
 	].join("\n");
 }
 
@@ -459,7 +385,7 @@ ${budgetBlock(goal)}
 
 Keep this goal in force until it is actually achieved. Do not pause for confirmation just because a phase, chapter, file, or checklist item is finished. At each natural stopping point, compare every explicit requirement with concrete evidence from the workspace/session. If the objective is complete, call update_goal with status=complete. If it is not complete, choose the next concrete action and do it.
 
-If you hit a real blocker that you cannot resolve with one more reasonable next step (missing credentials, contradictory spec, file/permission you cannot access, dangerous operation pending user approval, sisyphus precondition not in the plan), the CORRECT action is to call pause_goal({reason, suggestedAction?}) with a structured, non-empty reason. pause_goal IS the channel for handing control back to the user — do not substitute a conversational "blocked, please help" summary in your final message and skip the tool call. Without pause_goal, the goal stays "active" and the UI cannot show the blocker. After pause_goal returns, you may add one short user-facing summary, but the tool call comes first.
+If you hit a real blocker that you cannot resolve with one more reasonable next step (missing credentials, contradictory spec, file/permission you cannot access, dangerous operation pending user approval, or an unclear Sisyphus-style ordered plan), the CORRECT action is to call pause_goal({reason, suggestedAction?}) with a structured, non-empty reason. pause_goal IS the channel for handing control back to the user — do not substitute a conversational "blocked, please help" summary in your final message and skip the tool call. Without pause_goal, the goal stays "active" and the UI cannot show the blocker. After pause_goal returns, you may add one short user-facing summary, but the tool call comes first.
 
 Do NOT silently invent workarounds, fake completion, or quietly redefine the objective. Do NOT call update_goal=complete to escape a blocker.${sisyphusDisciplineBlock(goal) ? `\n${sisyphusDisciplineBlock(goal)}` : ""}`;
 }
@@ -493,7 +419,7 @@ function continuationPrompt(goal: GoalRecord): string {
 		"Do not call update_goal unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.",
 		"Do not ask the user for confirmation unless there is a real blocker.",
 		"",
-		"If you hit a real blocker (missing credentials, contradictory spec, file/permission you cannot access, dangerous operation pending user approval, a sisyphus step whose precondition is not in the plan), call pause_goal({reason, suggestedAction?}) and stop. Do not silently invent workarounds. Do not fake completion. pause_goal is the structured way to hand control back to the user; update_goal=complete is not an escape hatch for blockers.",
+		"If you hit a real blocker (missing credentials, contradictory spec, file/permission you cannot access, dangerous operation pending user approval, or an unclear Sisyphus-style ordered plan), call pause_goal({reason, suggestedAction?}) and stop. Do not silently invent workarounds. Do not fake completion. pause_goal is the structured way to hand control back to the user; update_goal=complete is not an escape hatch for blockers.",
 		...(goal.sisyphus ? ["", sisyphusDisciplineBlock(goal)] : []),
 	].join("\n");
 }
@@ -521,14 +447,12 @@ function goalTweakDraftingPrompt(current: GoalRecord, hint: string): string {
 	const sisyphusOn = current.sisyphus;
 	const focusItems = sisyphusOn
 		? [
-			"Tweak focus (this is a Sisyphus goal) — depending on the hint, clarify changes to:",
+			"Tweak focus (this is a Sisyphus goal style) — depending on the hint, clarify changes to:",
 			"  - The objective / success criteria / boundaries",
-			"  - The numbered execution steps (add, remove, reorder, refine, or change the done criterion of a specific step)",
-			"  - Order constraints (which steps must strictly follow which)",
+			"  - The ordered plan or completion standard, if the user wants to change it",
 			"  - Failure / blocker handling",
 			"  - Don't-do boundaries",
-			"Always preserve the Sisyphus discipline. Do not drop the strict step-by-step structure. Keep the === Sisyphus Goal === block with numbered steps and per-step done criteria.",
-			"Note: applying a tweak resets the sisyphus step counter to 0/N (the agent will re-walk the new step list).",
+			"Preserve the Sisyphus style unless the user explicitly asks to turn it into a regular goal. Sisyphus is a prompt/criteria variant, not a separate step-counter mechanism.",
 		]
 		: [
 			"Tweak focus — depending on the hint, clarify changes to:",
@@ -546,7 +470,7 @@ function goalTweakDraftingPrompt(current: GoalRecord, hint: string): string {
 		"<current_objective>",
 		promptSafeObjective(current.objective),
 		"</current_objective>",
-		`Sisyphus mode: ${sisyphusOn ? "on (strict step-by-step)" : "off"}`,
+		`Sisyphus mode: ${sisyphusOn ? "on (prompt/criteria style)" : "off"}`,
 		"",
 		"User's tweak hint (may be empty):",
 		"<tweak_hint>",
@@ -559,7 +483,7 @@ function goalTweakDraftingPrompt(current: GoalRecord, hint: string): string {
 		"- Do NOT call create_goal (a goal already exists).",
 		"- Do NOT call update_goal.",
 		"- Do NOT call pause_goal during this drafting interview (it pauses execution \u2014 you are not executing, you are revising).",
-		"- Do NOT call step_complete during this drafting interview.",
+		"- Do NOT call step_complete during this drafting interview. It is a legacy compatibility tool, not part of the current Sisyphus design.",
 		"- Do NOT use bash, write, edit, or read to modify the goal file directly. The goal file is managed by the extension.",
 		"- You MAY clarify via plain chat, the built-in goal_question/goal_questionnaire tools, or any question-like user-dialogue tool. They all return user intent into the conversation; treat them the same. Do NOT use workhorse/reconnaissance tools for clarification.",
 		"- Do NOT start new task work in this turn.",
@@ -569,7 +493,7 @@ function goalTweakDraftingPrompt(current: GoalRecord, hint: string): string {
 		"When the revision is clear:",
 		"1. Call apply_goal_tweak with:",
 		"   - newObjective: the FULL revised objective text, formatted the same way as the original" + (sisyphusOn
-			? " === Sisyphus Goal === block (Objective / Success criteria / Boundaries / Constraints / Steps with numbered N. ... — done when: ... entries / Order rules / Don'ts / If blocked / Sisyphus reminder)."
+			? " === Sisyphus Goal === block (Objective / Success criteria / Boundaries / Constraints / If blocked / Sisyphus reminder)."
 			: " === Goal === block (Objective / Success criteria / Boundaries / Constraints / If blocked)."),
 		"   - changeSummary: one sentence describing what changed.",
 		"2. apply_goal_tweak is the ONLY sanctioned way to change an active goal's objective. It atomically updates the goal record and the on-disk file. Do not attempt to bypass it.",
@@ -693,13 +617,6 @@ function serializeGoalFile(goal: GoalRecord): string {
 	if (goal.pauseReason) pauseLines.push(`- Agent pause reason: ${goal.pauseReason}`);
 	if (goal.pauseSuggestedAction) pauseLines.push(`- Agent suggests: ${goal.pauseSuggestedAction}`);
 	const pauseBlock = pauseLines.length > 0 ? `\n${pauseLines.join("\n")}` : "";
-	const stepLines: string[] = [];
-	if (goal.sisyphus && typeof goal.totalSteps === "number" && goal.totalSteps > 0) {
-		const done = goal.stepsCompleted ?? 0;
-		const cur = goal.currentStep ?? done + 1;
-		stepLines.push(`- Sisyphus progress: ${done}/${goal.totalSteps} steps completed (currentStep=${cur})`);
-	}
-	const stepBlock = stepLines.length > 0 ? `\n${stepLines.join("\n")}` : "";
 	return `${meta}
 
 # Goal Prompt
@@ -710,10 +627,10 @@ ${goal.objective.trim()}
 
 - Status: ${statusLabel(goal)}
 - Auto-continue: ${goal.autoContinue ? "on" : "off"}
-- Sisyphus mode: ${goal.sisyphus ? "yes (no skipping, no rushing, step-by-step)" : "no"}
+- Sisyphus mode: ${goal.sisyphus ? "yes (prompt/criteria style)" : "no"}
 - Time spent: ${formatDuration(goal.usage.activeSeconds)}
 - Tokens used: ${formatTokenValue(goal.usage.tokensUsed)}
-- Token budget: ${formatTokenBudget(goal)}${stepBlock}${pauseBlock}
+- Token budget: ${formatTokenBudget(goal)}${pauseBlock}
 `;
 }
 
@@ -959,13 +876,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let autoContinueLimitWarnedFor: string | null = null;
 
 	// Per-turn flags reset in turn_start (#4, C9 fix).
-	// sisyphusToolCalledThisTurn: tracks whether SISYPHUS_WORK_TOOL_NAMES was called.
+	// goalWorkToolCalledThisTurn: tracks whether a real goal-work tool was called.
 	//   If false at turn_end, we don't queue another autoContinue (empty chat turn).
 	// turnStoppedFor: set by pause_goal / update_goal(complete) / apply_goal_tweak
 	//   after their successful execute. Once set, pi.on("tool_call") blocks all
 	//   subsequent in-turn tool calls except POST_STOP_ALLOWED_TOOLS. This is the
 	//   schema fix for "agent keeps writing files after pause_goal".
-	let sisyphusToolCalledThisTurn = false;
+	let goalWorkToolCalledThisTurn = false;
 	let turnStoppedFor: string | null = null;
 
 	// #5 post-compaction resync: when a compaction just happened, the next agent
@@ -989,9 +906,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				if (goalRunning) active.add(name);
 				else active.delete(name);
 			}
-			// step_complete is only available when a sisyphus goal is running.
-			if (goalRunning && goal?.sisyphus) active.add(SISYPHUS_STEP_TOOL_NAME);
-			else active.delete(SISYPHUS_STEP_TOOL_NAME);
+			// Sisyphus is now a prompt/criteria style, not a separate step-counter
+			// mechanism. Keep step_complete registered for legacy transcripts, but do
+			// not expose it as an active work tool.
+			active.delete(SISYPHUS_STEP_TOOL_NAME);
 			// apply_goal_tweak is only available during a /goal-tweak drafting flow.
 			// Note: tweak drafting can run against active OR paused goals.
 			if (goal && tweakDraftingFor === goal.id) {
@@ -1460,13 +1378,12 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		);
 
 		const draftId = `draft-${focus}-${Date.now().toString(36)}`;
-		// Phase 5 D + B1 + B2: arm drafting state. Schema gates fire when the
+		// Phase 5 D + B1: arm drafting state. Schema gate fires when the
 		// agent calls propose_goal_draft. create_goal becomes hidden.
 		draftingFor = {
 			focus,
 			originalTopic: trimmed,
-			userStepCount: countUserSteps(trimmed),
-			draftId,
+				draftId,
 			startedAt: Date.now(),
 		};
 		syncGoalTools();
@@ -1733,21 +1650,20 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		},
 	}));
 
-	// Phase 5 D + B1 + B2: agent's drafting-time entry point. Replaces create_goal
-	// during /goal-set or /goal-sis drafting. Shows the user a goal_questionnaire-style
-	// preview of the draft with two choices: [Confirm] (creates the goal) or
-	// [Continue Chatting] (returns control to the agent for more interview). Schema gates:
+	// Phase 5 D + B1: agent's drafting-time entry point. Replaces create_goal
+	// during /goal-set or /goal-sis drafting. Shows the user a full plain-text
+	// draft report with two choices: [Confirm] (creates the goal) or
+	// [Continue Chatting] (returns control to the agent for more interview). Schema gate:
 	//   B1 focus-vs-sisyphus consistency
-	//   B2 step-count preservation (no agent-invented steps)
 	// In headless mode (no UI), auto-confirms — harness-friendly.
 	pi.registerTool(defineTool({
 		name: PROPOSE_DRAFT_TOOL_NAME,
 		label: "Propose Goal Draft",
-		description: "During /goal-set or /goal-sis drafting, propose the goal draft to the user. The user sees a goal_questionnaire-style preview and chooses Confirm (creates the goal) or Continue Chatting (returns control to you to refine). REPLACES create_goal during drafting.",
-		promptSnippet: "Propose the drafted goal to the user with a Confirm / Continue Chatting goal_questionnaire.",
+		description: "During /goal-set or /goal-sis drafting, propose the goal draft to the user. The user sees a full plain-text confirmation report and chooses Confirm (creates the goal) or Continue Chatting (returns control to you to refine). REPLACES create_goal during drafting.",
+		promptSnippet: "Propose the drafted goal to the user with a full plain-text Confirm / Continue Chatting dialog.",
 		promptGuidelines: [
 			"Call propose_goal_draft ONLY when you are inside a /goal-set or /goal-sis drafting flow AND you have gathered enough info to write a concrete goal. If you have not asked enough questions, keep interviewing the user — do not propose prematurely.",
-			"The user will see the full objective text plus a [Confirm] / [Continue Chatting] goal_questionnaire choice. Confirm creates the goal; Continue Chatting returns control to you to ask follow-up questions.",
+			"The user will see a full plain-text draft report plus a [Confirm] / [Continue Chatting] choice. Confirm creates the goal; Continue Chatting returns control to you to ask follow-up questions.",
 			"If the tool returns 'continue chatting', ask the user what they want changed. Do NOT propose again immediately with the same content; iterate based on their feedback first.",
 			"The sisyphus field must match the user's drafting focus: /goal-sis → sisyphus=true, /goal-set → sisyphus=false. The schema enforces this; mismatched proposals are REJECTED.",
 			"For sisyphus goals, the objective MUST include the user's numbered steps verbatim — do not add steps the user did not request (e.g. extra 'verify the precondition' steps), do not merge steps, do not reorder. The schema rejects drafts whose step count exceeds the user's original by more than 1.",
@@ -1784,7 +1700,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const autoContinueFlag = params.autoContinue ?? true;
 			const sisyphusFlag = validation.expectedSisyphus;
 			const budgetFromTopic = pendingBudget;
-			const draftSummary = buildDraftSummaryMarkdown({
+			const draftSummary = buildDraftConfirmationText({
 				focus: activeDrafting.focus,
 				originalTopic: activeDrafting.originalTopic,
 				objective,
@@ -1959,84 +1875,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool(defineTool({
 		name: SISYPHUS_STEP_TOOL_NAME,
-		label: "Sisyphus Step Complete",
-		description: "Mark one numbered step of the current Sisyphus goal as completed. Required after each step before moving to the next; the schema rejects update_goal(complete) until step_complete has been called for every numbered step. Supports an optional verifyCommand that the framework executes to PROVE the step's done criterion is met — if it exits non-zero, the step is NOT marked complete.",
-		promptSnippet: "Mark the current Sisyphus step as completed (with one-sentence evidence + optional verifyCommand the framework runs).",
+		label: "Sisyphus Step Complete (Legacy)",
+		description: "Legacy compatibility tool. Current Sisyphus mode is a prompt/criteria style and no longer uses schema-tracked step completion.",
+		promptSnippet: "Legacy no-op: Sisyphus no longer requires step_complete.",
 		promptGuidelines: [
-			"Only call step_complete on a Sisyphus goal that has a numbered step list. stepIndex must equal the current step (stepsCompleted + 1).",
-			"Call this exactly once per step, AFTER you have executed the step AND verified it against its done criterion. Do not call step_complete to skip a step or to claim a future step.",
-			"evidence must be a concrete one-sentence proof of the step's done criterion (e.g. 'a.txt exists with content \"a\" verified by read').",
-			"STRONGLY PREFER passing a verifyCommand whenever the step has a checkable filesystem or shell-level criterion. The framework will execute it as `bash -c <verifyCommand>` in the working directory; exit code 0 means PASS and the step is marked complete; non-zero means FAIL and the step is REJECTED. This closes the 'I claimed the step was done but actually wasn't' failure mode. Examples: `test -f a.txt && [ \"$(cat a.txt)\" = a ]`, `diff -q expected.txt actual.txt`, `grep -q '^Hello, Goal!$' hello.txt`.",
-			"Keep verifyCommand short, deterministic, and read-only (no destructive operations). It runs with a 30-second timeout.",
-			"You cannot call update_goal(status=complete) on a Sisyphus goal until step_complete has been called for every numbered step. The schema enforces this.",
+			"Do not call this in normal operation. Sisyphus mode shares the normal goal lifecycle and completion gate.",
+			"Complete the goal with update_goal(status=complete) only when the full objective is actually satisfied.",
 		],
 		parameters: Type.Object({
-			stepIndex: Type.Integer({ minimum: 1, description: "The 1-indexed step number you just finished. Must equal the current step (stepsCompleted + 1)." }),
-			evidence: Type.String({ description: "One-sentence concrete proof that the step's done criterion is met." }),
-			verifyCommand: Type.Optional(Type.String({
-				description: "OPTIONAL shell command (run as `bash -c`) that the framework executes to verify the step's done criterion. Exit code 0 = pass and the step is marked complete. Non-zero exit = FAIL and step_complete is REJECTED. Strongly recommended for any step with a filesystem or shell-level done criterion (e.g. 'test -f a.txt && [ \"$(cat a.txt)\" = a ]'). 30-second timeout.",
-			})),
+			stepIndex: Type.Integer({ minimum: 1, description: "Legacy step index. Ignored." }),
+			evidence: Type.String({ description: "Legacy evidence text. Ignored by the schema." }),
+			verifyCommand: Type.Optional(Type.String({ description: "Legacy field. Not executed." })),
 		}),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const evidence = params.evidence.trim();
-			if (!evidence) throw new Error("step_complete requires a non-empty evidence string.");
-			const stepGate = validateStepCompletion({ goal, runningGoalId, stepIndex: params.stepIndex, evidence });
-			if (!stepGate.ok) {
-				return {
-					content: [{ type: "text", text: stepGate.message }],
-					details: goalDetails(goal),
-				};
-			}
-			if (!goal || typeof goal.totalSteps !== "number") throw new Error("Goal disappeared during step validation.");
-			const { done, stepIndex } = stepGate;
-			// #2 verifyCommand — schema-level evidence verification (pi-autoresearch checks.sh pattern).
-			// If the agent supplied a verifyCommand, run it. If it exits non-zero, REJECT the step.
-			// This closes the "I claimed step done but actually didn't do the work" hallucination failure.
-			let verifySummary = "";
-			const verifyCommandRaw = typeof params.verifyCommand === "string" ? params.verifyCommand.trim() : "";
-			if (verifyCommandRaw) {
-				let verifyResult: { code: number; killed: boolean; stdout: string; stderr: string } | null = null;
-				let execError: string | null = null;
-				try {
-					verifyResult = await pi.exec("bash", ["-c", verifyCommandRaw], {
-						cwd: ctx.cwd,
-						timeout: 30_000,
-					});
-				} catch (err) {
-					execError = err instanceof Error ? err.message : String(err);
-				}
-				const verifyGate = classifyVerifyCommandResult({ stepIndex, result: verifyResult, execError });
-				if (!verifyGate.ok) {
-					return {
-						content: [{ type: "text", text: verifyGate.message }],
-						details: goalDetails(goal),
-					};
-				}
-				verifySummary = verifyGate.summary;
-			}
-			const next: GoalRecord = {
-				...goal,
-				stepsCompleted: done + 1,
-				currentStep: done + 2 > goal.totalSteps ? goal.totalSteps : done + 2,
-				updatedAt: nowIso(),
-			};
-			setGoal(next, ctx);
-			const remaining = (next.totalSteps ?? 0) - (next.stepsCompleted ?? 0);
-			const tail = remaining === 0
-				? ` All ${next.totalSteps} steps complete. Call update_goal(complete) to finish the goal.`
-				: ` ${remaining} step(s) remain. Proceed to step ${next.currentStep}.`;
-			// Phase 5 C2: structured METRIC line (pi-autoresearch pattern). External
-			// graders / log scrapers can parse this without LLM-output-interpretation.
-			const metricLine = `METRIC step=${stepIndex} total=${next.totalSteps ?? 0} done=${next.stepsCompleted ?? 0} verifyCommand=${verifyCommandRaw ? "passed" : "absent"} evidence_chars=${evidence.length}`;
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			return {
-				content: [{ type: "text", text: `step_complete recorded: step ${stepIndex}/${next.totalSteps}.${verifySummary} Evidence: ${truncateText(evidence, 160)}.${tail}\n${metricLine}` }],
+				content: [{ type: "text", text: "step_complete is no longer required. Sisyphus is now a prompt/criteria style that uses the normal goal lifecycle. Continue working from the objective, or call update_goal(status=complete) only when the full objective is satisfied." }],
 				details: goalDetails(goal),
 			};
 		},
 		renderCall(args, theme) {
-			const verifyMark = typeof args?.verifyCommand === "string" && args.verifyCommand.trim() ? " ✓" : "";
-			return new Text(theme.fg("toolTitle", "step_complete ") + theme.fg("success", `#${args?.stepIndex ?? "?"}${verifyMark}`), 0, 0);
+			return new Text(theme.fg("toolTitle", "step_complete legacy ") + theme.fg("muted", `#${args?.stepIndex ?? "?"}`), 0, 0);
 		},
 		renderResult(result, _options, theme) {
 			return renderGoalResult(result, theme);
@@ -2051,13 +1910,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Only call apply_goal_tweak inside a /goal-tweak drafting flow (the prompt makes that explicit). It is rejected at any other time.",
 			"newObjective must be the FULL revised objective text, formatted the same way as the original (=== Goal === or === Sisyphus Goal === block). Do NOT pass a diff or partial patch; pass the whole new objective.",
-			"For Sisyphus goals: preserve the numbered Steps section. Step count is re-parsed from the new objective and stepsCompleted is reset to 0 because the plan has changed.",
+			"For Sisyphus goals: preserve the Sisyphus style and ordered-plan wording unless the user explicitly asks to remove it.",
 			"changeSummary is a one-sentence description of WHAT changed (for the activity log and pause messages).",
 			"Do NOT use write/edit/bash to modify the active goal file directly. apply_goal_tweak is the only sanctioned channel.",
 			"After apply_goal_tweak returns, stop. Do not begin new task work in the same turn. The system will queue the next continuation.",
 		],
 		parameters: Type.Object({
-			newObjective: Type.String({ description: "The complete revised objective text. For Sisyphus goals, must include the numbered Steps section." }),
+			newObjective: Type.String({ description: "The complete revised objective text. For Sisyphus goals, preserve the Sisyphus style unless the user explicitly changes it." }),
 			changeSummary: Type.String({ description: "One-sentence description of what was changed (used in UI notification and tweak log)." }),
 		}),
 		executionMode: "sequential",
@@ -2089,16 +1948,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (!newObjective) throw new Error("apply_goal_tweak requires a non-empty newObjective.");
 			const changeSummary = params.changeSummary.trim();
 			if (!changeSummary) throw new Error("apply_goal_tweak requires a non-empty changeSummary.");
-			const wasSisyphus = goal.sisyphus;
-			const newTotal = wasSisyphus ? parseSisyphusStepCount(newObjective) : null;
 			const next: GoalRecord = {
 				...goal,
 				objective: newObjective,
 				updatedAt: nowIso(),
-				// Plan changed: reset the sisyphus step counter so the agent re-walks the new steps.
-				totalSteps: wasSisyphus ? (newTotal ?? null) : undefined,
-				stepsCompleted: wasSisyphus ? 0 : undefined,
-				currentStep: wasSisyphus ? 1 : undefined,
 				// Clear any prior agent pause reason — the user has redefined the work.
 				pauseReason: undefined,
 				pauseSuggestedAction: undefined,
@@ -2123,14 +1976,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			turnStoppedFor = goal.id;
 			syncGoalTools();
 			updateUI(ctx);
-			const stepInfo = wasSisyphus
-				? (newTotal !== null ? ` Sisyphus step count: ${newTotal}.` : " Sisyphus step count could not be parsed.")
-				: "";
-			ctx.ui.notify(`Goal tweaked: ${truncateText(changeSummary, 160)}${stepInfo}`, "info");
+			ctx.ui.notify(`Goal tweaked: ${truncateText(changeSummary, 160)}`, "info");
 			return {
 				content: [{
 					type: "text",
-					text: `Goal tweak applied. ${changeSummary}${stepInfo}\nStop now; the next continuation will arrive automatically if the goal is active.`,
+					text: `Goal tweak applied. ${changeSummary}\nStop now; the next continuation will arrive automatically if the goal is active.`,
 				}],
 				details: goalDetails(goal),
 				terminate: true,
@@ -2185,7 +2035,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 
 	pi.on("turn_start", async (_event, ctx) => {
 		// Per-turn flag resets (#4 + C9 fix).
-		sisyphusToolCalledThisTurn = false;
+		goalWorkToolCalledThisTurn = false;
 		turnStoppedFor = null;
 		beginAccounting();
 		updateUI(ctx);
@@ -2220,8 +2070,8 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		});
 		if (draftingGate.block) return draftingGate;
 		// Track for #4 empty-turn gate.
-		if (SISYPHUS_WORK_TOOL_SET.has(event.toolName)) {
-			sisyphusToolCalledThisTurn = true;
+		if (GOAL_WORK_TOOL_SET.has(event.toolName)) {
+			goalWorkToolCalledThisTurn = true;
 		}
 		return;
 	});
@@ -2247,7 +2097,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			!isToolUseAssistantMessage(message)
 			&& goal?.status === "active"
 			&& goal.autoContinue
-			&& sisyphusToolCalledThisTurn
+			&& goalWorkToolCalledThisTurn
 		) {
 			queueContinuation(ctx);
 		}
@@ -2282,9 +2132,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	pi.on("session_compact", async (_event, ctx) => {
 		if (goal) persist(ctx);
 		beginAccounting();
-		// #5: arm a post-compaction resync reminder for the next agent turn.
-		// The LLM-generated compaction summary may have lost or mis-narrated the
-		// sisyphus step counter; we need the next turn to trust the schema.
+		// Arm a generic post-compaction reminder for the next agent turn.
 		if (shouldArmPostCompactReminder(goal)) {
 			postCompactReminderPending = true;
 		}
@@ -2347,24 +2195,10 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				systemPrompt: `${event.systemPrompt}\n\n[PI GOAL BUDGET LIMIT goalId=${goal.id}]\n${untrustedObjectiveBlock(goal)}\n\n${budgetBlock(goal)}\n\nThe goal is budget_limited. Do not start new substantive work for it. Summarize useful progress, identify remaining work, and leave the user a clear next step.`,
 			};
 		}
-		// #5: post-compaction resync reminder, one-shot. Tells the agent that
-		// the LLM compaction summary may have lost or mis-narrated the sisyphus
-		// step counter, and to TRUST the schema-tracked N/M in the goal block.
 		let prompt = goalPrompt(goal);
 		if (shouldInjectPostCompactReminder({ pending: postCompactReminderPending, goal })) {
 			postCompactReminderPending = false;
-			const total = typeof goal.totalSteps === "number" && goal.totalSteps > 0 ? goal.totalSteps : null;
-			const done = goal.stepsCompleted ?? 0;
-			const cur = goal.currentStep ?? done + 1;
-			const totalStr = total !== null ? String(total) : "?";
-			const resyncBlock = [
-				"",
-				`[POST-COMPACTION RESYNC goalId=${goal.id}]`,
-				"The conversation was just compacted. The LLM-generated compaction summary above may not faithfully reflect the schema-tracked step counter for this Sisyphus goal.",
-				`AUTHORITATIVE state from the schema (trust this, NOT the summary's narrative): ${done} of ${totalStr} steps marked complete. Next step to execute: step ${cur}.`,
-				"Do not assume earlier steps are done unless they appear in this counter. Do not assume later steps are pending unless they appear in this counter. The next concrete action is step " + cur + ".",
-			].join("\n");
-			prompt = `${prompt}\n${resyncBlock}`;
+			prompt = `${prompt}\n\n[POST-COMPACTION RESYNC goalId=${goal.id}]\nThe conversation was just compacted. Re-read the objective and continue from the actual artifacts/state; do not rely on memory of the prior chat.`;
 		}
 		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
 	});

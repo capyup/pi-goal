@@ -16,27 +16,6 @@ export interface GoalDisplayRecordLike {
 export { isQuestionLikeToolName } from "./goal-tool-names.ts";
 
 
-export function countUserSteps(topic: string): number {
-	const lines = topic.split(/\r?\n/);
-	const stepNumbers = new Set<number>();
-	for (const rawLine of lines) {
-		const m = rawLine.match(/^\s*(\d{1,3})[.)、]\s*\S/);
-		if (m) {
-			const n = Number(m[1]);
-			if (Number.isFinite(n) && n >= 1 && n <= 999) stepNumbers.add(n);
-		}
-	}
-	if (stepNumbers.size > 0) return Math.max(...stepNumbers);
-	// Conservative non-Arabic fallback: at least two markers before treating prose as steps.
-	const cnMarkers = [/(?:^|[\s,;.，；。])第[一二三四五六七八九十]/g];
-	let cnHits = 0;
-	for (const re of cnMarkers) {
-		const matches = topic.match(re);
-		if (matches) cnHits += matches.length;
-	}
-	return cnHits >= 2 ? cnHits : 0;
-}
-
 export function parseTokenBudgetFromTopic(topic: string): number | null {
 	// Look for patterns like "5000 tokens", "10000 token budget", "预算 20000".
 	const beforeKeyword = topic.match(/\b(\d{3,})\s*(tokens?|token[-\s]?budget|token[-\s]?cap)\b/i)
@@ -47,22 +26,6 @@ export function parseTokenBudgetFromTopic(topic: string): number | null {
 	if (!raw) return null;
 	const n = Number(raw);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
-}
-
-export function parseSisyphusStepCount(objective: string): number | null {
-	const lines = objective.split(/\r?\n/);
-	const stepNumbers = new Set<number>();
-	for (const rawLine of lines) {
-		const m = rawLine.match(/^\s*(\d{1,3})\.\s+\S/);
-		if (m) {
-			const n = Number(m[1]);
-			if (Number.isFinite(n) && n >= 1 && n <= 999) stepNumbers.add(n);
-		}
-	}
-	if (stepNumbers.size === 0) return null;
-	let max = 0;
-	for (const n of stepNumbers) if (n > max) max = n;
-	return max;
 }
 
 export function truncateText(value: string, max = 120): string {

@@ -1,4 +1,4 @@
-import { statusLabel, truncateText, type GoalDisplayRecordLike } from "./goal-core.ts";
+import { statusLabel, type GoalDisplayRecordLike } from "./goal-core.ts";
 
 export type GoalStatusLike = "active" | "paused" | "budgetLimited" | "complete";
 export type StopReasonLike = "user" | "agent";
@@ -7,30 +7,12 @@ export interface GoalPolicyRecordLike extends GoalDisplayRecordLike {
 	id: string;
 	status: GoalStatusLike;
 	updatedAt?: string;
-	totalSteps?: number | null;
-	stepsCompleted?: number;
-	currentStep?: number;
 	pauseReason?: string;
 	pauseSuggestedAction?: string;
 }
 
 export type PolicyValidation =
 	| { ok: true }
-	| { ok: false; message: string };
-
-export type StepValidation =
-	| { ok: true; evidence: string; done: number; expected: number; stepIndex: number }
-	| { ok: false; message: string };
-
-export interface VerifyCommandResultLike {
-	code: number;
-	killed: boolean;
-	stdout: string;
-	stderr: string;
-}
-
-export type VerifyCommandPolicy =
-	| { ok: true; summary: string }
 	| { ok: false; message: string };
 
 export function isGoalUnfinished(goal: Pick<GoalPolicyRecordLike, "status"> | null | undefined): boolean {
@@ -61,21 +43,6 @@ export function validateGoalCompletion(args: {
 	if (!goal) return { ok: false, message: "No goal is set." };
 	if (runningGoalId && goal.id !== runningGoalId) return { ok: false, message: "The active goal changed during this run; not marking it complete." };
 	if (!isRunnableStatus(goal.status)) return { ok: false, message: `Goal is ${statusLabel(goal)}; ask the user to resume it before marking complete.` };
-	if (goal.sisyphus && typeof goal.totalSteps === "number" && goal.totalSteps > 0) {
-		const done = goal.stepsCompleted ?? 0;
-		if (done < goal.totalSteps) {
-			const remaining = goal.totalSteps - done;
-			return {
-				ok: false,
-				message: `update_goal(complete) REJECTED: this is a Sisyphus goal with ${goal.totalSteps} numbered steps. ` +
-					`Only ${done} step(s) have been marked complete via step_complete. ` +
-					`${remaining} step(s) remain. ` +
-					`Either (a) execute step ${done + 1} and call step_complete({stepIndex: ${done + 1}, evidence: ...}), ` +
-					`or (b) call pause_goal({reason, suggestedAction?}) if you cannot complete the remaining step(s). ` +
-					`Sisyphus completion cannot be claimed until step_complete has been called for all ${goal.totalSteps} steps.`,
-			};
-		}
-	}
 	return { ok: true };
 }
 
@@ -142,78 +109,6 @@ export function buildGoalCreatedReport(args: { objective: string; detailedSummar
 	return lines.join("\n");
 }
 
-export function validateStepCompletion(args: {
-	goal: GoalPolicyRecordLike | null;
-	runningGoalId?: string | null;
-	stepIndex: number;
-	evidence: string;
-}): StepValidation {
-	const { goal, runningGoalId } = args;
-	if (!goal) return { ok: false, message: "No goal is set; step_complete is a no-op." };
-	if (runningGoalId && goal.id !== runningGoalId) return { ok: false, message: "The active goal changed during this run; not advancing the step counter." };
-	if (!goal.sisyphus) return { ok: false, message: "step_complete only applies to Sisyphus goals. This goal is not in Sisyphus mode." };
-	if (!isRunnableStatus(goal.status)) return { ok: false, message: `Goal is ${statusLabel(goal)}; step_complete does not apply.` };
-	if (typeof goal.totalSteps !== "number" || goal.totalSteps <= 0) {
-		return { ok: false, message: "This Sisyphus goal has no parseable numbered step count; step_complete cannot advance. If steps were intended, ask the user to /goal-tweak to add an explicit numbered Steps section." };
-	}
-	const evidence = args.evidence.trim();
-	if (!evidence) return { ok: false, message: "step_complete requires a non-empty evidence string." };
-	const done = goal.stepsCompleted ?? 0;
-	const expected = done + 1;
-	const stepIndex = Math.floor(args.stepIndex);
-	if (stepIndex !== expected) {
-		return {
-			ok: false,
-			message: `step_complete REJECTED: stepIndex=${stepIndex} but the next expected step is ${expected} ` +
-				`(${done}/${goal.totalSteps} completed so far). ` +
-				(stepIndex < expected
-					? `Step ${stepIndex} was already marked complete. Do not re-mark it.`
-					: `You cannot skip to step ${stepIndex}; execute step ${expected} first and call step_complete({stepIndex: ${expected}, evidence: ...}).`),
-		};
-	}
-	if (done >= goal.totalSteps) {
-		return { ok: false, message: `All ${goal.totalSteps} steps are already marked complete. Call update_goal(complete) to finish the goal.` };
-	}
-	return { ok: true, evidence, done, expected, stepIndex };
-}
-
-export function classifyVerifyCommandResult(args: {
-	stepIndex: number;
-	result: VerifyCommandResultLike | null;
-	execError?: string | null;
-}): VerifyCommandPolicy {
-	const { stepIndex, result } = args;
-	const execError = args.execError ?? null;
-	if (execError || !result) {
-		return {
-			ok: false,
-			message: `step_complete REJECTED: verifyCommand could not be executed (${execError ?? "unknown error"}). ` +
-				`Step ${stepIndex} is NOT marked complete. Fix the command and retry, or call step_complete without verifyCommand if you have a different way to prove it.`,
-		};
-	}
-	const out = ((result.stdout || "") + (result.stderr ? `\n[stderr]\n${result.stderr}` : "")).trim();
-	if (result.killed) {
-		return {
-			ok: false,
-			message: `step_complete REJECTED: verifyCommand TIMED OUT after 30s. ` +
-				`Step ${stepIndex} is NOT marked complete. The criterion was not proven. ` +
-				`Either simplify the verifyCommand or actually finish the step before retrying.` +
-				(out ? `\n\nPartial output:\n${truncateText(out, 600)}` : ""),
-		};
-	}
-	if (result.code !== 0) {
-		return {
-			ok: false,
-			message: `step_complete REJECTED: verifyCommand exited with code ${result.code} (non-zero = criterion not met). ` +
-				`Step ${stepIndex} is NOT marked complete. ` +
-				`Either (a) actually execute the step so the criterion is satisfied, then retry step_complete, ` +
-				`or (b) if the step is genuinely blocked, call pause_goal({reason, suggestedAction?}).` +
-				(out ? `\n\nVerify output:\n${truncateText(out, 800)}` : ""),
-		};
-	}
-	return { ok: true, summary: " verifyCommand passed (exit 0)." };
-}
-
 export function shouldQueueContinuation(goal: Pick<GoalPolicyRecordLike, "status" | "autoContinue"> | null): boolean {
 	return !!goal && goal.status === "active" && goal.autoContinue;
 }
@@ -239,9 +134,9 @@ export function buildAutoContinueCapPause<T extends GoalPolicyRecordLike>(goal: 
 }
 
 export function shouldArmPostCompactReminder(goal: Pick<GoalPolicyRecordLike, "sisyphus" | "status"> | null): boolean {
-	return !!goal && goal.sisyphus && isRunnableStatus(goal.status);
+	return !!goal && isRunnableStatus(goal.status);
 }
 
 export function shouldInjectPostCompactReminder(args: { pending: boolean; goal: Pick<GoalPolicyRecordLike, "sisyphus"> | null }): boolean {
-	return args.pending && !!args.goal?.sisyphus;
+	return args.pending && !!args.goal;
 }

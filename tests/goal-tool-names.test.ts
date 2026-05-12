@@ -4,12 +4,12 @@ import test from "node:test";
 import {
 	ACTIVE_GOAL_TOOL_NAMES,
 	CREATE_GOAL_TOOL_NAME,
+	GOAL_WORK_TOOL_NAMES,
 	POST_STOP_ALLOWED_TOOLS,
 	PROPOSE_DRAFT_TOOL_NAME,
 	QUESTIONNAIRE_TOOL_NAME,
 	QUESTION_TOOL_NAME,
 	SISYPHUS_STEP_TOOL_NAME,
-	SISYPHUS_WORK_TOOL_NAMES,
 	TWEAK_APPLY_TOOL_NAME,
 	isQuestionLikeToolName,
 } from "../extensions/goal-tool-names.ts";
@@ -25,9 +25,8 @@ test("goal tool names are centralized and preserve published agent-facing names"
 	assert.deepEqual(POST_STOP_ALLOWED_TOOLS, ["get_goal"]);
 });
 
-test("sisyphus work tool set keeps question tools and workhorse tools visible to continuation gating", () => {
+test("goal work tool set keeps lifecycle and workhorse tools visible to continuation gating", () => {
 	for (const toolName of [
-		SISYPHUS_STEP_TOOL_NAME,
 		TWEAK_APPLY_TOOL_NAME,
 		CREATE_GOAL_TOOL_NAME,
 		PROPOSE_DRAFT_TOOL_NAME,
@@ -37,8 +36,9 @@ test("sisyphus work tool set keeps question tools and workhorse tools visible to
 		"bash",
 		"write",
 	]) {
-		assert.equal(SISYPHUS_WORK_TOOL_NAMES.includes(toolName as typeof SISYPHUS_WORK_TOOL_NAMES[number]), true);
+		assert.equal(GOAL_WORK_TOOL_NAMES.includes(toolName as typeof GOAL_WORK_TOOL_NAMES[number]), true);
 	}
+	assert.equal(GOAL_WORK_TOOL_NAMES.includes(SISYPHUS_STEP_TOOL_NAME as typeof GOAL_WORK_TOOL_NAMES[number]), false);
 });
 
 test("isQuestionLikeToolName allows dialogue tools but not workhorse tools", () => {

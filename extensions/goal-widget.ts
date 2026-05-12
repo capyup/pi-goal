@@ -11,15 +11,12 @@ import {
 	type GoalDisplayRecordLike,
 } from "./goal-core.ts";
 
-const SISYPHUS_BAR_WIDTH = 10;
 
 type GoalWidgetColor = Extract<ThemeColor, "accent" | "warning" | "success" | "error" | "dim" | "muted" | "text">;
 
 export interface GoalWidgetRecord extends GoalDisplayRecordLike {
 	activePath?: string | null;
 	archivedPath?: string | null;
-	totalSteps?: number | null;
-	stepsCompleted?: number;
 	pauseReason?: string;
 	pauseSuggestedAction?: string;
 }
@@ -34,18 +31,16 @@ function fit(value: string, width: number): string {
 	return visibleWidth(value) > width ? truncateToWidth(value, width, "…") : value;
 }
 
-function line(theme: Theme, width: number, marker: "top" | "mid" | "tail", content: string): string {
-	const prefix = marker === "top" ? "╭─" : marker === "tail" ? "╰─" : "│ ";
-	const color: ThemeColor = marker === "top" || marker === "tail" ? "borderMuted" : "dim";
-	return fit(`${theme.fg(color, prefix)} ${content}`, width);
+function heading(theme: Theme, width: number, left: string, right = ""): string {
+	if (!right) return fit(left, width);
+	const rightPart = ` ${right}`;
+	const fill = Math.max(1, width - visibleWidth(left) - visibleWidth(rightPart));
+	return fit(`${left}${theme.fg("dim", " ".repeat(fill))}${rightPart}`, width);
 }
 
-function ruleHeading(theme: Theme, width: number, left: string, right = ""): string {
-	const leftPart = `${theme.fg("borderMuted", "╭─")} ${left}`;
-	if (!right) return fit(leftPart, width);
-	const rightPart = ` ${right}`;
-	const fill = Math.max(1, width - visibleWidth(leftPart) - visibleWidth(rightPart));
-	return fit(`${leftPart}${theme.fg("borderMuted", "─".repeat(fill))}${rightPart}`, width);
+function branchLine(theme: Theme, width: number, isLast: boolean, content: string): string {
+	const prefix = isLast ? "└─" : "├─";
+	return fit(`${theme.fg("dim", prefix)} ${content}`, width);
 }
 
 function displayIcon(goal: GoalWidgetRecord): { icon: string; color: GoalWidgetColor; label: string } {
@@ -60,19 +55,8 @@ function displayIcon(goal: GoalWidgetRecord): { icon: string; color: GoalWidgetC
 	return goal.autoContinue ? { icon: "●", color: "accent", label: "goal running" } : { icon: "○", color: "muted", label: "goal idle" };
 }
 
-function sisyphusBar(goal: GoalWidgetRecord, theme: Theme): string {
-	const total = goal.totalSteps ?? 0;
-	if (!goal.sisyphus || total <= 0) return "";
-	const done = Math.min(goal.stepsCompleted ?? 0, total);
-	const filled = Math.max(0, Math.min(SISYPHUS_BAR_WIDTH, Math.round((done / total) * SISYPHUS_BAR_WIDTH)));
-	const empty = SISYPHUS_BAR_WIDTH - filled;
-	return `[${theme.fg("accent", "▰".repeat(filled))}${theme.fg("dim", "▱".repeat(empty))}] ${done}/${total}`;
-}
-
-function headingMeta(goal: GoalWidgetRecord, theme: Theme): string {
+function headingMeta(goal: GoalWidgetRecord): string {
 	const bits: string[] = [];
-	const bar = sisyphusBar(goal, theme);
-	if (bar) bits.push(bar);
 	if (goal.status === "active" && goal.autoContinue) bits.push("auto");
 	if (goal.usage.activeSeconds > 0) bits.push(formatDuration(goal.usage.activeSeconds));
 	if (goal.usage.tokensUsed > 0) bits.push(formatTokenValue(goal.usage.tokensUsed));
@@ -85,30 +69,32 @@ export function renderGoalWidgetLines(goal: GoalWidgetRecord | null, theme: Them
 	const { icon, color, label } = displayIcon(goal);
 	const mode = goal.sisyphus ? "Sisyphus" : "Goal";
 	const headingLeft = `${theme.fg(color, icon)} ${theme.fg(color, theme.bold(mode))} ${theme.fg("muted", label.replace(/^sisyphus |^goal /, ""))}`;
-	const headingRight = theme.fg("muted", headingMeta(goal, theme));
-	const lines: string[] = [ruleHeading(theme, safeWidth, headingLeft, headingRight)];
+	const headingRight = theme.fg("muted", headingMeta(goal));
+	const lines: string[] = [heading(theme, safeWidth, headingLeft, headingRight)];
+	const body: string[] = [];
 
 	const titleWidth = Math.max(12, safeWidth - 8);
 	const objective = truncateText(displayObjectiveTitle(goal.objective), titleWidth);
-	lines.push(line(theme, safeWidth, "mid", `${theme.fg("accent", "⟡")} ${theme.fg("text", objective)}`));
+	body.push(`${theme.fg("accent", "⟡")} ${theme.fg("text", objective)}`);
 
 	if (goal.tokenBudget !== null) {
-		lines.push(line(theme, safeWidth, "mid", `${theme.fg("dim", "budget")} ${theme.fg("muted", `${formatTokenBudget(goal)} · remaining ${formatRemainingTokens(goal)}`)}`));
+		body.push(`${theme.fg("dim", "budget")} ${theme.fg("muted", `${formatTokenBudget(goal)} · remaining ${formatRemainingTokens(goal)}`)}`);
 	}
 
 	if (goal.status === "paused" && goal.stopReason === "agent" && goal.pauseReason) {
-		lines.push(line(theme, safeWidth, "mid", `${theme.fg("warning", "blocker")} ${theme.fg("warning", truncateText(goal.pauseReason, Math.max(12, safeWidth - 14)))}`));
+		body.push(`${theme.fg("warning", "blocker")} ${theme.fg("warning", truncateText(goal.pauseReason, Math.max(12, safeWidth - 14)))}`);
 		if (goal.pauseSuggestedAction) {
-			lines.push(line(theme, safeWidth, "mid", `${theme.fg("dim", "next")} ${theme.fg("muted", truncateText(goal.pauseSuggestedAction, Math.max(12, safeWidth - 10)))}`));
+			body.push(`${theme.fg("dim", "next")} ${theme.fg("muted", truncateText(goal.pauseSuggestedAction, Math.max(12, safeWidth - 10)))}`);
 		}
 	}
 
 	const path = goal.status === "complete" ? goal.archivedPath : goal.activePath;
 	if (path) {
-		lines.push(line(theme, safeWidth, "tail", theme.fg("dim", path)));
-	} else {
-		const last = lines.pop() ?? "";
-		lines.push(fit(last.replace(theme.fg("dim", "│ "), theme.fg("borderMuted", "╰─")), safeWidth));
+		body.push(theme.fg("dim", path));
+	}
+
+	for (const [index, content] of body.entries()) {
+		lines.push(branchLine(theme, safeWidth, index === body.length - 1, content));
 	}
 
 	return lines;

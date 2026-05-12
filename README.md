@@ -6,13 +6,13 @@ The extension is designed around one rule: **the user owns intent; the agent exe
 
 ## What it provides
 
-- **Two goal modes**: regular goals for open-ended work, and Sisyphus goals for strict ordered plans.
+- **Two goal styles**: regular goals for open-ended work, and Sisyphus goals for patient ordered execution.
 - **Draft-before-run flow**: `/goal-set` and `/goal-sis` start a drafting conversation before any work begins.
 - **Confirm-before-commit**: the agent must call `propose_goal_draft`; the user confirms or keeps chatting.
 - **Full goal visibility**: after confirmation, the final objective is printed back into the conversation in full.
 - **Auto-continue loop**: confirmed goals can continue across turns until completion, pause, budget limit, abort, or user interruption.
 - **Schema gates**: unsafe lifecycle transitions are rejected by tool validators, not just prompts.
-- **Step gate for Sisyphus mode**: every ordered step must be marked with `step_complete` before final completion.
+- **Sisyphus as a light variant**: Sisyphus shares the normal lifecycle/tools and differs only in prompt style and completion standard.
 - **Pause/resume/clear lifecycle**: goals can be paused by the user, paused by the agent when blocked, resumed, or archived.
 - **Disk-backed state**: active and archived goals are stored under `.pi/goals/`.
 - **Lightweight built-in questionnaire tools**: `goal_question` and `goal_questionnaire` let the agent ask structured drafting questions without depending on another package.
@@ -50,7 +50,7 @@ Flow:
 
 1. The agent asks any needed clarifying questions.
 2. The agent calls `propose_goal_draft` with a concrete objective.
-3. pi shows a confirmation UI.
+3. pi shows a full plain-text confirmation report.
 4. If confirmed, the full finalized goal is printed into the conversation and written to `.pi/goals/`.
 5. The agent works until it calls `update_goal(status="complete")`, pauses, hits a budget/cap, or the user interrupts.
 
@@ -60,13 +60,13 @@ Flow:
 /goal-sis Refactor the auth flow: 1) extract token validation. 2) wire it into login. 3) update tests.
 ```
 
-Sisyphus mode is for linear plans. The agent must call `step_complete` for step 1, then step 2, then step 3. `update_goal(status="complete")` is rejected until all numbered steps are complete.
+Sisyphus mode is for patient ordered execution. It uses the same lifecycle and tools as a regular goal; the difference is the prompt style and completion standard: preserve the user's order, do not rush, do not invent preflight/reconnaissance steps, and stop to ask when blocked.
 
 ## User commands
 
 ```text
 /goal-set <topic>       Start drafting a regular goal
-/goal-sis <topic>       Start drafting a strict step-by-step goal
+/goal-sis <topic>       Start drafting a Sisyphus-style goal
 /sis <topic>            Alias for /goal-sis
 /goal-status            Show current goal state
 /goal-tweak <change>    Draft a revision to the active/paused goal
@@ -90,7 +90,7 @@ The extension exposes tools only when they make sense for the current lifecycle 
 | `apply_goal_tweak` | tweak drafting only | Submit a revision to an existing goal |
 | `update_goal` | active goal | Mark the goal complete when all requirements are satisfied |
 | `pause_goal` | active goal | Pause because of a real blocker |
-| `step_complete` | active Sisyphus goal | Mark the next numbered step complete |
+| `step_complete` | hidden / legacy | Compatibility no-op; Sisyphus no longer requires a step counter |
 | `create_goal` | hidden | Internal compatibility path; normal creation goes through `propose_goal_draft` |
 
 ## Drafting behavior
@@ -109,7 +109,7 @@ Blocked during goal drafting:
 - shell/file/search tools such as `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`
 - lifecycle tools that would mutate execution state before the user confirms
 
-When a draft is confirmed, the tool result includes the full final objective, not a one-line summary. This makes the confirmed contract visible in the conversation as well as on disk.
+When a draft is proposed, the confirmation UI shows a full plain-text report with draft details, the original topic, and the proposed goal. When it is confirmed, the tool result includes the full final objective, not a one-line summary. This makes the confirmed contract visible in the conversation as well as on disk.
 
 ## Completion behavior
 
@@ -123,9 +123,9 @@ The completion result prints a full report into the conversation:
 
 - `Goal complete.`
 - optional completion summary / evidence supplied by the agent
-- full current goal details, including objective, status, usage, budget, Sisyphus progress, and file path
+- full current goal details, including objective, status, usage, budget, mode, and file path
 
-For Sisyphus goals, completion is rejected until all numbered steps have been completed with `step_complete`.
+Sisyphus goals use the same completion tool as regular goals. The stricter part is the prompt/criteria standard: the agent should only complete after the whole ordered objective is actually satisfied.
 
 ## Schema gates
 
@@ -135,15 +135,12 @@ The shipped gates are intentionally small and mechanical.
 |---|---|
 | Drafting tool whitelist | The agent doing repo reconnaissance before the user confirms a goal |
 | Focus consistency | `/goal-set` accidentally becoming Sisyphus, or `/goal-sis` becoming regular mode |
-| Step preservation | The agent inflating a user-provided Sisyphus plan with invented extra steps |
 | Confirm-before-commit | The agent silently creating or replacing a goal |
 | Completion gate | Completing paused, stale, missing, or unfinished goals |
-| Sisyphus step gate | Skipping, duplicating, or reordering numbered steps |
-| `verifyCommand` gate | Marking a Sisyphus step complete when the proof command fails |
 | Post-stop block | Continuing to call tools after `pause_goal`, `update_goal`, or `apply_goal_tweak` stops the turn |
 | Auto-continue cap | Runaway continuation chains |
 | Abort pause | Active goals staying active after user abort / Ctrl-C |
-| Post-compaction reminder | Losing Sisyphus progress after session compaction |
+| Post-compaction reminder | Losing the active objective after session compaction |
 
 ## Files
 
@@ -178,7 +175,7 @@ npm run check
 npm pack --dry-run
 ```
 
-The fast unit suite uses Node's built-in test runner and covers core parsing, drafting gates, lifecycle policy, questionnaire formatting, centralized tool names, Sisyphus step validation, completion reporting, and display helpers.
+The fast unit suite uses Node's built-in test runner and covers core parsing, drafting gates, lifecycle policy, questionnaire formatting, centralized tool names, Sisyphus prompt-style behavior, completion reporting, and display helpers.
 
 The experiment harness under `experiments/` runs full pi sessions against real model calls and mechanical rubrics.
 

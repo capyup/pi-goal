@@ -12,7 +12,7 @@ npm pack --dry-run
 
 ## Unit test coverage
 
-The fast local suite uses Node's built-in `node:test` runner and currently covers 25 tests across:
+The fast local suite uses Node's built-in `node:test` runner and currently covers the core modules across:
 
 - `tests/goal-core.test.ts`
 - `tests/goal-draft.test.ts`
@@ -26,12 +26,12 @@ The fast local suite uses Node's built-in `node:test` runner and currently cover
 
 | Module | Covered behavior |
 |---|---|
-| `extensions/goal-core.ts` | User step counting, Sisyphus step-count parsing, token budget parsing, compact duration/token/status display, objective-title cleanup |
-| `extensions/goal-draft.ts` | Drafting prompt, draft summary, safe objective escaping, B1 focus gate, B2 step-preservation gate, drafting tool gate |
-| `extensions/goal-policy.ts` | Creation/completion/pause/resume/clear policy, Sisyphus step validation, verify-command classification, auto-continue cap, budget transition, compaction reminder, full creation/completion reports |
+| `extensions/goal-core.ts` | Token budget parsing, compact duration/token/status display, objective-title cleanup |
+| `extensions/goal-draft.ts` | Drafting prompt, draft summary, safe objective escaping, B1 focus gate, Sisyphus prompt-style guidance, drafting tool gate |
+| `extensions/goal-policy.ts` | Creation/completion/pause/resume/clear policy, auto-continue cap, budget transition, compaction reminder, full creation/completion reports |
 | `extensions/goal-questionnaire.ts` | Question normalization, duplicate id handling, option filtering, recommended-index validation, answer formatting, confirm/cancel mapping, `goal_question` and `goal_questionnaire` registration |
-| `extensions/goal-tool-names.ts` | Published tool constants, active-tool list, Sisyphus work-tool list, post-stop allowlist, question-like tool detection |
-| `extensions/goal-widget.ts` | Goal Beacon rendering, Sisyphus progress, budget/status/path lines, blocker/suggested-action display |
+| `extensions/goal-tool-names.ts` | Published tool constants, active-tool list, goal work-tool list, post-stop allowlist, question-like tool detection |
+| `extensions/goal-widget.ts` | Goal Beacon rendering, Sisyphus style label, budget/status/path lines, blocker/suggested-action display |
 
 ## Refactor rule
 

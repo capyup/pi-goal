@@ -1,6 +1,6 @@
 # pi-goal Architecture
 
-This document describes the shipped `pi-goal` extension as it exists now. It intentionally focuses on implemented behavior rather than design explorations.
+This document describes the shipped `pi-goal` extension as it exists now. It focuses on implemented behavior.
 
 ## Runtime shape
 
@@ -18,12 +18,12 @@ Reusable logic is split into smaller modules:
 
 | Module | Responsibility |
 |---|---|
-| `goal-core.ts` | Step counting, token-budget parsing, compact display formatting, status labels, objective title cleanup |
-| `goal-draft.ts` | Drafting prompts, draft summary construction, draft proposal validation, drafting-stage tool gate |
-| `goal-policy.ts` | Lifecycle policy, pause/resume/complete validation, Sisyphus step validation, verify-command classification, budget/compaction policy, full result reports |
+| `goal-core.ts` | Token-budget parsing, compact display formatting, status labels, objective title cleanup |
+| `goal-draft.ts` | Drafting prompts, plain-text draft confirmation report, draft proposal validation, drafting-stage tool gate |
+| `goal-policy.ts` | Lifecycle policy, pause/resume/complete validation, budget/compaction policy, full result reports |
 | `goal-questionnaire.ts` | Built-in questionnaire types, normalization, answer formatting, TUI question runner, proposal confirmation dialog, question-tool registration |
-| `goal-tool-names.ts` | Published tool-name constants, active-tool lists, post-stop allowlist, Sisyphus work-tool list, question-like tool detection |
-| `goal-widget.ts` | Above-editor Goal Beacon component, Sisyphus progress bar, blocker/budget/status rendering |
+| `goal-tool-names.ts` | Published tool-name constants, active-tool lists, post-stop allowlist, goal work-tool list, question-like tool detection |
+| `goal-widget.ts` | Above-editor Goal Beacon component, blocker/budget/status rendering |
 
 ## Lifecycle
 
@@ -40,13 +40,12 @@ Reusable logic is split into smaller modules:
   ├─ active goal
   │    ├─ autoContinue queues checkpoint turns
   │    ├─ pause_goal pauses on real blockers
-  │    ├─ step_complete advances Sisyphus progress
   │    └─ update_goal complete archives and prints full completion report
   │
   └─ /goal-clear archives or cancels drafting
 ```
 
-## Goal modes
+## Goal styles
 
 ### Regular goal
 
@@ -54,15 +53,13 @@ Regular goals are open-ended objectives. The agent decides the next concrete act
 
 ### Sisyphus goal
 
-Sisyphus goals are strict ordered plans. The extension parses numbered steps from the objective and tracks:
+Sisyphus is a light variant of the same goal lifecycle. It does not have a separate execution state machine or step counter. The only differences are prompt/criteria level:
 
-- `totalSteps`
-- `stepsCompleted`
-- `currentStep`
+- drafting asks for a patient ordered-execution style when relevant;
+- continuations remind the agent not to rush, skip, or invent preflight steps;
+- completion still uses `update_goal(status="complete")`, with the stricter expectation that the whole ordered objective is actually satisfied.
 
-`step_complete` only accepts the next step. It rejects skipped, duplicate, out-of-order, empty-evidence, wrong-mode, paused, stale, or already-finished calls.
-
-`update_goal(status="complete")` is rejected until all steps are complete.
+The legacy `step_complete` tool remains registered as a hidden compatibility no-op for old transcripts, but it is not exposed as an active work tool and is not required for completion.
 
 ## Drafting and confirmation
 
@@ -73,10 +70,9 @@ Drafting is a user-intent collection phase. The agent may clarify through normal
 - a drafting flow must be active;
 - no unfinished goal may already exist;
 - objective must be non-empty;
-- `sisyphus` must match the command the user invoked;
-- Sisyphus drafts must preserve the user's numbered plan instead of inventing extra steps.
+- `sisyphus` must match the command the user invoked.
 
-On confirmation, the result prints the full finalized objective in the conversation. The same objective is also written to the active goal file.
+When `propose_goal_draft` asks for confirmation, the UI shows a full plain-text draft report rather than a Markdown preview. On confirmation, the result prints the full finalized objective in the conversation. The same objective is also written to the active goal file.
 
 ## Tool visibility
 
@@ -85,7 +81,7 @@ Tool visibility is recomputed whenever state changes.
 - Drafting exposes `goal_question`, `goal_questionnaire`, `get_goal`, and `propose_goal_draft`.
 - Tweak drafting exposes question tools, `get_goal`, and `apply_goal_tweak`.
 - Active goals expose `get_goal`, `update_goal`, and `pause_goal`.
-- Active Sisyphus goals additionally expose `step_complete`.
+- `step_complete` is hidden legacy compatibility.
 - `create_goal` remains hidden in normal user flows.
 
 The `tool_call` interceptor blocks:
@@ -116,7 +112,7 @@ When `autoContinue` is on, the extension queues continuation prompts after agent
 - the user aborts the turn;
 - the token budget is exhausted;
 - `PI_GOAL_MAX_AUTOCONTINUE_TURNS` is reached;
-- Sisyphus mode detects an empty turn without meaningful work.
+- a turn ends without meaningful goal-work tool activity.
 
 Continuation prompts include a goal id so stale prompts can be detected and neutralized.
 
@@ -147,8 +143,7 @@ They cover:
 - questionnaire normalization and answer formatting;
 - tool-name constants and question-like detection;
 - lifecycle policy;
-- Sisyphus step validation;
-- verify-command classification;
+- Sisyphus prompt-style behavior;
 - budget and auto-continue cap behavior;
 - full creation/completion report formatting.
 

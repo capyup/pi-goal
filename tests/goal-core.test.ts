@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-	countUserSteps,
 	displayObjectiveTitle,
 	footerStatus,
 	formatDuration,
@@ -10,25 +9,11 @@ import {
 	formatTokenBudget,
 	formatTokenValue,
 	isQuestionLikeToolName,
-	parseSisyphusStepCount,
 	parseTokenBudgetFromTopic,
 	statusLabel,
 	truncateText,
 	type GoalDisplayRecordLike,
 } from "../extensions/goal-core.ts";
-
-test("countUserSteps counts explicit user numbered steps", () => {
-	assert.equal(countUserSteps("1. write tests\n2) split module\n3、verify"), 3);
-	assert.equal(countUserSteps("Do one thing, not a list"), 0);
-	assert.equal(countUserSteps("第一，先测试。第二，再拆分。"), 2);
-});
-
-test("parseSisyphusStepCount returns the highest valid numbered step", () => {
-	const objective = "=== Sisyphus Goal ===\nSteps:\n  1. create a.txt\n  2. create b.txt\n  4. skipped number but still max";
-	assert.equal(parseSisyphusStepCount(objective), 4);
-	assert.equal(parseSisyphusStepCount("No numbered steps"), null);
-	assert.equal(parseSisyphusStepCount("1000. ignored"), null);
-});
 
 test("parseTokenBudgetFromTopic extracts user-provided token budgets", () => {
 	assert.equal(parseTokenBudgetFromTopic("please use 5000 tokens max"), 5000);

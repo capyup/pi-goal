@@ -1,4 +1,3 @@
-import { parseSisyphusStepCount } from "./goal-core.ts";
 import { isQuestionLikeToolName } from "./goal-tool-names.ts";
 
 export type GoalDraftingFocus = "goal" | "sisyphus";
@@ -6,7 +5,6 @@ export type GoalDraftingFocus = "goal" | "sisyphus";
 export interface DraftingStateLike {
 	focus: GoalDraftingFocus;
 	originalTopic: string;
-	userStepCount: number;
 }
 
 export interface DraftProposalInput {
@@ -28,7 +26,7 @@ export function promptSafeObjective(objective: string): string {
 	return objective.replace(/<\/?untrusted_objective>/gi, (tag) => tag.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 }
 
-export function buildDraftSummaryMarkdown(args: {
+export function buildDraftConfirmationText(args: {
 	focus: GoalDraftingFocus;
 	originalTopic: string;
 	objective: string;
@@ -36,22 +34,21 @@ export function buildDraftSummaryMarkdown(args: {
 	tokenBudget: number | null;
 }): string {
 	const lines: string[] = [];
-	const modeBadge = args.focus === "sisyphus" ? "**Mode:** Sisyphus (strict step-by-step)" : "**Mode:** Normal goal";
-	lines.push(modeBadge);
-	lines.push(`**Auto-continue:** ${args.autoContinue ? "yes" : "no"}`);
+	const modeLabel = args.focus === "sisyphus" ? "Sisyphus (prompt/criteria style)" : "Normal goal";
+	lines.push("Goal draft ready for confirmation.");
+	lines.push("");
+	lines.push("Draft details:");
+	lines.push(`Mode: ${modeLabel}`);
+	lines.push(`Auto-continue: ${args.autoContinue ? "yes" : "no"}`);
 	if (args.tokenBudget !== null) {
-		lines.push(`**Token budget:** ${args.tokenBudget.toLocaleString("en-US")}`);
+		lines.push(`Token budget: ${args.tokenBudget.toLocaleString("en-US")}`);
 	}
 	lines.push("");
-	lines.push("---");
+	lines.push("Original topic:");
 	lines.push("");
-	lines.push("**Your original topic:**");
+	lines.push(args.originalTopic.trim());
 	lines.push("");
-	lines.push("> " + args.originalTopic.replace(/\r?\n/g, "\n> "));
-	lines.push("");
-	lines.push("---");
-	lines.push("");
-	lines.push("**Agent's proposed goal:**");
+	lines.push("Proposed goal:");
 	lines.push("");
 	lines.push(args.objective);
 	return lines.join("\n");
@@ -117,23 +114,6 @@ export function validateGoalDraftProposal(input: DraftProposalInput): DraftPropo
 		return { ok: false, message: "propose_goal_draft REJECTED: objective is empty." };
 	}
 
-	if (expectedSisyphus && input.drafting.userStepCount > 0) {
-		const proposedStepCount = parseSisyphusStepCount(objective) ?? 0;
-		const tolerance = 1;
-		if (proposedStepCount > input.drafting.userStepCount + tolerance) {
-			return {
-				ok: false,
-				message: `propose_goal_draft REJECTED (B2 step gate): user wrote ${input.drafting.userStepCount} numbered step(s), but your draft has ${proposedStepCount}. Do NOT invent reconnaissance/verification/setup steps the user didn't ask for. Keep the step list at ${input.drafting.userStepCount} (or at most ${input.drafting.userStepCount + tolerance}) — if you genuinely think an extra step is needed, ASK THE USER first instead of adding it unilaterally.`,
-			};
-		}
-		if (proposedStepCount < input.drafting.userStepCount) {
-			return {
-				ok: false,
-				message: `propose_goal_draft REJECTED (B2 step gate): user wrote ${input.drafting.userStepCount} numbered step(s) but your draft has only ${proposedStepCount}. Do not merge or drop steps. Each numbered step must appear in the objective.`,
-			};
-		}
-	}
-
 	return { ok: true, objective, expectedSisyphus };
 }
 
@@ -154,7 +134,7 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 		"- The only task-affecting tool you may call during drafting is propose_goal_draft, and only after the items below are clear. Before that, you may ask/clarify via plain chat or question-like tools; get_goal is allowed for read-only state. If the topic is impossibly vague (e.g. empty), ask the user for the topic itself; do not call propose_goal_draft with placeholder content.",
 		"- Do not call propose_goal_draft until the items below are clear, EITHER from the original topic OR from your Q&A.",
 		"- propose_goal_draft will show the user a [Confirm] / [Continue Chatting] dialog. If they Confirm, the goal is created. If they Continue Chatting, you go back to interviewing them. There is no 'create_goal' shortcut anymore; everything goes through propose_goal_draft.",
-		"- IMPORTANT for Sisyphus: do NOT add reconnaissance / verification / preflight / 'check that X exists' steps that the user did not ask for. Use the user's numbered steps as-is. Schema gate B2 will REJECT proposals whose step count exceeds the user's original step count.",
+		"- IMPORTANT for Sisyphus: do NOT add reconnaissance / verification / preflight / 'check that X exists' steps that the user did not ask for. Use the user's requested order/style as-is. Sisyphus is a prompt/criteria variant, not a separate step-counter mechanism.",
 	];
 
 	const goalFocusItems = [
@@ -168,12 +148,11 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 
 	const sisyphusFocusItems = [
 		"Drafting focus for /sis — establish everything /goal would (objective, criteria, boundaries, constraints, blocker handling) PLUS:",
-		"  A. The numbered, ordered execution steps. Concrete, atomic steps the agent will execute one by one. No 'and then figure out the rest' steps.",
-		"  B. The done criterion for EACH step (how do we know that single step is finished and correct).",
-		"  C. Order constraints: which steps must strictly follow which, and which (if any) are allowed to swap.",
-		"  D. Per-step failure rule: when a step fails or is unclear, default to stop-and-ask the user; do not improvise workarounds.",
-		"  E. Don't-do boundaries: things the agent must NOT do during execution (touch unrelated files, batch steps, skip ahead, etc.).",
-		"  F. Note: Sisyphus mode means the discipline is the point. The objective text must be explicit enough that strict step-by-step execution is possible.",
+		"  A. The ordered execution style the user wants: patient, sequential, no rushing, no unrequested reconnaissance.",
+		"  B. Any user-provided ordered plan, preserved without adding extra mechanism steps.",
+		"  C. The completion standard: what evidence proves the whole objective is actually done.",
+		"  D. Failure rule: when blocked or unclear, default to stop-and-ask the user; do not improvise workarounds.",
+		"  E. Note: Sisyphus mode is a prompt/criteria style. It shares the same lifecycle and tools as a regular goal.",
 	];
 
 	const createGoalShape = focus === "sisyphus"
@@ -188,16 +167,10 @@ export function goalDraftingPrompt(topic: string, focus: GoalDraftingFocus): str
 			"    Success criteria: <observable evidence the goal is done>",
 			"    Boundaries: <in scope / out of scope>",
 			"    Constraints: <hard rules, files not to touch, etc.>",
-			"    Steps:",
-			"      1. <atomic step 1> — done when: <criterion>",
-			"      2. <atomic step 2> — done when: <criterion>",
-			"      ...",
-			"    Order rules: <strict-order vs swappable, if any>",
-			"    Don'ts: <things the agent must not do>",
 			"    If blocked / unclear / failing: <rule, default = stop and ask the user>",
-			"    Sisyphus reminder: No skipping. No rushing. No improvising. Each step is the work itself.",
+			"    Sisyphus reminder: Work patiently and sequentially. No rushing, no unrequested preflight steps, no improvising around blockers.",
 			"",
-			"After the user confirms in the dialog, the goal becomes active and a continuation will arrive. Begin step 1 then. Not before. If the user picks 'Continue Chatting' instead, ask them what to revise.",
+			"After the user confirms in the dialog, the goal becomes active and a continuation will arrive. Begin work then. Not before. If the user picks 'Continue Chatting' instead, ask them what to revise.",
 		]
 		: [
 			"When the items above are clear, summarize the plan back to the user in one short message and call propose_goal_draft with:",
