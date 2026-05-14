@@ -93,7 +93,7 @@ import {
 	untrustedObjectiveBlock,
 } from "./prompts/goal-prompts.ts";
 import { buildGoalRunningNotification } from "./widgets/goal-notifications.ts";
-import { GoalWidgetComponent } from "./widgets/goal-widget.ts";
+import { GoalWidgetComponent, type AuditorWidgetProgress } from "./widgets/goal-widget.ts";
 
 import {
 	abortGoalCommandMessage,
@@ -239,7 +239,7 @@ function normalizeGoalEventDetails(value: unknown): GoalEventDetails {
 }
 
 interface GoalAuditEventDetails {
-	phase: "started" | "approved" | "rejected";
+	phase: "started" | "approved" | "rejected" | "skipped";
 	goalId: string;
 	auditor?: string;
 }
@@ -268,7 +268,7 @@ function renderGoalEvent(message: { details?: GoalEventDetails }, options: { exp
 
 function renderGoalAuditEvent(message: { content?: unknown; details?: GoalAuditEventDetails }, _options: { expanded: boolean }, theme: Theme): Text {
 	const phase = message.details?.phase ?? "started";
-	const label = phase === "approved" ? "approved" : phase === "rejected" ? "rejected" : "started";
+	const label = phase === "approved" ? "approved" : phase === "rejected" ? "rejected" : phase === "skipped" ? "skipped" : "started";
 	const content = typeof message.content === "string" ? message.content : `Goal audit ${label}.`;
 	return new Text(
 		theme.fg("customMessageLabel", `Goal audit ${label}`) + "\n" + theme.fg("customMessageText", content),
@@ -367,6 +367,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	let terminalInputUnsubscribe: (() => void) | null = null;
 	let statusRefreshTimer: ReturnType<typeof setInterval> | null = null;
 	let statusRefreshCtx: ExtensionContext | null = null;
+	let auditProgress: AuditorWidgetProgress | null = null;
+	let auditAnimationTimer: ReturnType<typeof setInterval> | null = null;
+	let auditAbortController: AbortController | null = null;
 
 
 	// Per-turn flags reset in turn_start (#4, C9 fix).
@@ -440,6 +443,45 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			}
 			pi.setActiveTools(Array.from(active));
 		} catch {}
+	}
+
+	function stopAuditAnimation(): void {
+		if (auditAnimationTimer) {
+			clearInterval(auditAnimationTimer);
+			auditAnimationTimer = null;
+		}
+	}
+
+	function abortAudit(ctx: ExtensionContext): void {
+		if (!auditAbortController || !auditProgress) return;
+		const auditorConfig = loadGoalAuditorFileConfig(ctx.cwd);
+		auditAbortController.abort();
+		auditAbortController = null;
+		stopAuditAnimation();
+		auditProgress = null;
+		goalWidgetComponent?.invalidate();
+		ctx.ui.notify("Audit aborted by user. Goal remains open.", "warning");
+		if (state.goal) {
+			pi.sendMessage<GoalAuditEventDetails>({
+				customType: GOAL_AUDIT_ENTRY,
+				content: `Audit skipped by user for goal ${state.goal.id}. Goal remains open.`,
+				display: true,
+				details: { phase: "skipped", goalId: state.goal.id },
+			});
+			try {
+				appendGoalEvent(ctx, {
+					type: "audit_skipped",
+					goalId: state.goal.id,
+					reason: "user_aborted",
+					provider: auditorConfig.provider,
+					model: auditorConfig.model,
+					thinkingLevel: auditorConfig.thinkingLevel,
+					at: nowIso(),
+				});
+			} catch {
+				// Ledger append failure should not block skip
+			}
+		}
 	}
 
 	function stopStatusRefresh(): void {
@@ -733,6 +775,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 							theme,
 							getGoal: () => goalForDisplay() ?? state.goal,
 							getOpenGoalCount: () => openGoals().length,
+							getAuditorProgress: () => auditProgress,
 						});
 						return goalWidgetComponent;
 					},
@@ -759,6 +802,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 						theme,
 						getGoal: () => goalForDisplay() ?? state.goal,
 						getOpenGoalCount: () => openGoals().length,
+						getAuditorProgress: () => auditProgress,
 					});
 					return goalWidgetComponent;
 				},
@@ -884,6 +928,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) return;
 		terminalInputUnsubscribe?.();
 		terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
+			// If an audit is running, Escape aborts the audit instead of pausing
+			if (matchesKey(data, "escape") && auditProgress) {
+				abortAudit(ctx);
+				return undefined;
+			}
 			if (matchesKey(data, "escape") && state.goal?.status === "active" && state.goal.autoContinue) {
 				pauseActiveGoal(ctx);
 			}
@@ -1225,11 +1274,13 @@ export default function goalExtension(pi: ExtensionAPI): void {
 	}
 
 	function auditorConfigValue(config: GoalAuditorConfig, key: keyof GoalAuditorConfig): string {
+		if (key === "disabled") return config.disabled === true ? "true" : "false";
 		return config[key] ?? "(default)";
 	}
 
 	function auditorSettingsLines(config: GoalAuditorConfig): string[] {
 		return [
+			`disabled: ${auditorConfigValue(config, "disabled")}`,
 			`provider: ${auditorConfigValue(config, "provider")}`,
 			`model: ${auditorConfigValue(config, "model")}`,
 			`thinking_level: ${auditorConfigValue(config, "thinkingLevel")}`,
@@ -1241,10 +1292,11 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Goal auditor settings file: ${goalAuditorConfigPath(ctx.cwd)}`, "info");
 			return;
 		}
-		const fieldLabels = ["provider", "model", "thinking_level"] as const;
+		const fieldLabels = ["disabled", "provider", "model", "thinking_level"] as const;
 		while (true) {
 			const config = loadGoalAuditorFileConfig(ctx.cwd);
 			const options = [
+				`disabled: ${auditorConfigValue(config, "disabled")}`,
 				`provider: ${auditorConfigValue(config, "provider")}`,
 				`model: ${auditorConfigValue(config, "model")}`,
 				`thinking_level: ${auditorConfigValue(config, "thinkingLevel")}`,
@@ -1255,20 +1307,27 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const field = fieldLabels[index];
 			if (!field) return;
 			const key = field === "thinking_level" ? "thinkingLevel" : field;
-			const currentValue = auditorConfigValue(config, key);
+			if (key === "disabled") {
+				// Toggle the disabled flag
+				const next: GoalAuditorConfig = { ...config, disabled: !config.disabled };
+				saveGoalAuditorFileConfig(ctx.cwd, next);
+				ctx.ui.notify(`Goal auditor settings saved:\n${auditorSettingsLines(loadGoalAuditorFileConfig(ctx.cwd)).join("\n")}`, "info");
+				continue;
+			}
+			const currentValue = auditorConfigValue(config, key as keyof GoalAuditorConfig);
 			const input = await ctx.ui.input(`Set auditor ${field}`, currentValue === "(default)" ? "Leave empty for default" : currentValue);
 			if (input === undefined) continue;
 			const next: GoalAuditorConfig = { ...config };
 			const trimmed = input.trim();
 			if (!trimmed) {
-				delete next[key];
+				delete next[key as keyof GoalAuditorConfig];
 			} else if (key === "thinkingLevel") {
 				if (!["off", "minimal", "low", "medium", "high", "xhigh"].includes(trimmed)) {
 					ctx.ui.notify("thinking_level must be one of: off, minimal, low, medium, high, xhigh", "warning");
 					continue;
 				}
 				next.thinkingLevel = trimmed as GoalAuditorConfig["thinkingLevel"];
-			} else {
+			} else if (key === "provider" || key === "model") {
 				next[key] = trimmed;
 			}
 			saveGoalAuditorFileConfig(ctx.cwd, next);
@@ -1650,6 +1709,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			status: StringEnum([COMPLETE_STATUS] as const, { description: "Set to complete only when the objective is achieved." }),
 			completionSummary: Type.Optional(Type.String({ description: "Concise completion claim and evidence summary passed to the independent auditor agent." })),
+			confirmBypassAuditor: Type.Optional(Type.Boolean({ description: "Set to true to confirm bypassing the independent auditor when it is disabled in settings." })),
 		}),
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -1679,7 +1739,81 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const auditorLabel = auditorConfig.provider || auditorConfig.model || auditorConfig.thinkingLevel
 				? `${auditorConfig.provider ?? "default"}/${auditorConfig.model ?? "default"}${auditorConfig.thinkingLevel ? `:${auditorConfig.thinkingLevel}` : ""}`
 				: "default";
-			pi.sendMessage<GoalAuditEventDetails>({
+
+			// Check if auditor is disabled
+			if (auditorConfig.disabled === true) {
+				if (params.confirmBypassAuditor !== true) {
+					return {
+						content: [{ type: "text", text: [
+							"The completion auditor is disabled in settings.",
+							"",
+							`Use \`goal_question\` to ask the user: "The independent completion auditor is disabled. Bypass independent verification and mark the goal complete?"`,  
+							"If the user confirms, call update_goal again with confirmBypassAuditor: true.",
+						].join("\n") }],
+						details: goalDetails(state.goal),
+					};
+				}
+				// Auditor disabled and confirmed — skip audit, complete immediately
+				await pi.sendMessage<GoalAuditEventDetails>({
+					customType: GOAL_AUDIT_ENTRY,
+					content: `Auditor disabled — completion bypassed for goal ${auditTarget.id}.`,
+					display: true,
+					details: { phase: "skipped", goalId: auditTarget.id, auditor: auditorLabel },
+				}, { triggerTurn: true });
+				try {
+					appendGoalEvent(ctx, {
+						type: "audit_skipped",
+						goalId: auditTarget.id,
+						reason: "disabled",
+						provider: auditorConfig.provider,
+						model: auditorConfig.model,
+						thinkingLevel: auditorConfig.thinkingLevel,
+						at: nowIso(),
+					});
+				} catch {
+					// Ledger append failure should not block completion
+				}
+				// Mark goal complete directly (skip audit entirely)
+				accountProgress(ctx);
+				state.goal = auditTarget;
+				stopActiveGoal("complete", "agent", ctx);
+				const completedGoal = state.goal;
+				turnStoppedFor = completedGoal?.id ?? null;
+				auditProgress = null;
+				goalWidgetComponent?.invalidate();
+				if (completedGoal) {
+					resetGetGoalNudgeState(completedGoal.id);
+					goalsById.delete(completedGoal.id);
+					focusedGoalId = null;
+					appendFocusEntry(null, "completed");
+					syncGoalTools();
+					updateUI(ctx);
+					try {
+						appendGoalEvent(ctx, {
+							type: "goal_completed",
+							goalId: completedGoal.id,
+							archivePath: completedGoal.archivedPath,
+							at: nowIso(),
+						});
+					} catch {
+						// Ledger append failure should not crash completion
+					}
+				}
+				return {
+					content: [{
+						type: "text",
+						text: buildCompletionReport({
+							detailedSummary: detailedSummary(completedGoal),
+							completionSummary: params.completionSummary,
+						}),
+					}],
+					details: goalDetails(completedGoal),
+					terminate: true,
+				};
+			}
+
+			// Auditor is enabled — run the normal audit flow
+			await pi.sendMessage<GoalAuditEventDetails>({
 				customType: GOAL_AUDIT_ENTRY,
 				content: [
 					"Auditor: I am starting the independent completion audit.",
@@ -1689,7 +1823,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				].filter((line): line is string => line !== undefined).join("\n"),
 				display: true,
 				details: { phase: "started", goalId: auditTarget.id, auditor: auditorLabel },
-			});
+			}, { triggerTurn: true });
 			// Append ledger: audit started
 			try {
 				appendGoalEvent(ctx, {
@@ -1703,13 +1837,58 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			} catch {
 				// Ledger append failure should not block completion
 			}
+			// Set up auditor progress display (before createAgentSession)
+			const auditStartedAt = Date.now();
+			auditProgress = {
+				recentOutput: [],
+				phase: "running",
+				elapsedMs: 0,
+			};
+			// Start animation timer for the spinner in the auditor widget
+			stopAuditAnimation();
+			auditAnimationTimer = setInterval(() => {
+				if (!auditProgress) {
+					stopAuditAnimation();
+					return;
+				}
+				auditProgress.elapsedMs = Date.now() - auditStartedAt;
+				goalWidgetComponent?.invalidate();
+			}, 80);
+			auditAnimationTimer.unref?.();
+
+			// Create a dedicated AbortController for the audit so it can be interrupted via Escape
+			auditAbortController?.abort(); // Clean up any stale controller
+			auditAbortController = new AbortController();
+
 			const auditor = await runGoalCompletionAuditor({
 				ctx,
 				goal: auditTarget,
 				completionSummary: params.completionSummary,
 				detailedSummary: detailedSummary(auditTarget),
-				signal,
+				signal: auditAbortController.signal,
+				onProgress: (progress) => {
+					auditProgress = {
+						...progress,
+						elapsedMs: Date.now() - auditStartedAt,
+					};
+					goalWidgetComponent?.invalidate();
+				},
 			});
+			// Clear abort controller — audit finished on its own
+			auditAbortController = null;
+			// Clear auditor progress display
+			stopAuditAnimation();
+			// Show final audit output briefly before clearing
+			if (auditProgress && auditor.output) {
+				const outputLines = auditor.output.split("\n").slice(0, 8);
+				auditProgress = {
+					...auditProgress,
+					phase: "done",
+					recentOutput: outputLines,
+					elapsedMs: Date.now() - auditStartedAt,
+				};
+				goalWidgetComponent?.invalidate();
+			}
 			// Append ledger: audit result
 			const verdict = auditor.approved ? "approved" : auditor.error ? "error" : "disapproved" as const;
 			try {
@@ -1724,6 +1903,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// Ledger append failure should not block completion
 			}
 			if (!auditor.approved) {
+				// Clear auditor progress to restore normal widget state
+				auditProgress = null;
+				goalWidgetComponent?.invalidate();
 				const rejectionText = [
 					"Goal audit rejected.",
 					"",
@@ -1763,6 +1945,9 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			const completedGoal = state.goal;
 			// C9 fix: mark turn-stopped so subsequent in-turn tool calls are blocked.
 			turnStoppedFor = completedGoal?.id ?? null;
+			// Clear auditor progress to restore normal widget state
+			auditProgress = null;
+			goalWidgetComponent?.invalidate();
 			if (completedGoal) {
 				resetGetGoalNudgeState(completedGoal.id);
 				goalsById.delete(completedGoal.id);
