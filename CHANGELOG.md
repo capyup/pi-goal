@@ -8,6 +8,14 @@ with the `0.x` prefix indicating pre-1.0 development.
 
 ---
 
+## [0.8.1] — 2026-05-19
+
+### Changed
+
+- **Audit log messages clarified**: `extensions/goal.ts` — disabled/aborted audit messages now read naturally as goal completion notices ("Goal completed — auditor disabled in settings." / "Goal completed — auditor bypassed (user pressed Escape during audit).").
+
+---
+
 ## [0.8.0] — 2026-05-17
 
 ### Added
@@ -217,6 +225,7 @@ with the `0.x` prefix indicating pre-1.0 development.
 
 <!-- Version links for navigation -->
 
+[0.8.1]: https://github.com/tmonk/pi-goal-x/releases/tag/v0.8.1
 [0.8.0]: https://github.com/tmonk/pi-goal-x/releases/tag/v0.8.0
 [0.7.2]: https://github.com/tmonk/pi-goal-x/releases/tag/v0.7.2
 [0.7.1]: https://github.com/tmonk/pi-goal-x/releases/tag/v0.7.1

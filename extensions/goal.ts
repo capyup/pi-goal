@@ -1754,7 +1754,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				// Auditor disabled and confirmed — skip audit, complete immediately
 				await pi.sendMessage<GoalAuditEventDetails>({
 					customType: GOAL_AUDIT_ENTRY,
-					content: `Auditor disabled — completion bypassed for goal ${auditTarget.id}.`,
+					content: `Goal completed — auditor disabled in settings.`,
 					display: true,
 					details: { phase: "skipped", goalId: auditTarget.id, auditor: auditorLabel },
 				}, { triggerTurn: true });
@@ -1886,7 +1886,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			if (auditor.error === "Auditor aborted.") {
 				await pi.sendMessage<GoalAuditEventDetails>({
 					customType: GOAL_AUDIT_ENTRY,
-					content: `Auditor aborted — completion bypassed for goal ${auditTarget.id}.`,
+					content: `Goal completed — auditor bypassed (user pressed Escape during audit).`,
 					display: true,
 					details: { phase: "skipped", goalId: auditTarget.id, auditor: auditorLabel },
 				}, { triggerTurn: true });
